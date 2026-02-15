@@ -22,6 +22,7 @@ def init_db():
                 amount REAL NOT NULL,
                 confidence REAL,
                 reasoning TEXT,
+                trade_features TEXT,
                 venue TEXT NOT NULL,
                 mode TEXT NOT NULL,
                 trade_id TEXT,
@@ -112,14 +113,17 @@ def get_conn():
 
 
 def log_trade(bot_name, market_id, side, amount, venue, mode, confidence=None,
-              reasoning=None, market_question=None, trade_id=None, shares_bought=None):
+              reasoning=None, market_question=None, trade_id=None, shares_bought=None,
+              trade_features=None):
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO trades (bot_name, market_id, market_question, side, amount,
-               confidence, reasoning, venue, mode, trade_id, shares_bought)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               confidence, reasoning, trade_features, venue, mode, trade_id, shares_bought)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (bot_name, market_id, market_question, side, amount,
-             confidence, reasoning, venue, mode, trade_id, shares_bought)
+             confidence, reasoning,
+             json.dumps(trade_features) if trade_features else None,
+             venue, mode, trade_id, shares_bought)
         )
 
 

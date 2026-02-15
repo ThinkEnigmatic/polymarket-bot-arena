@@ -71,10 +71,10 @@ def run_evolution(bots, cycle_number):
     """Run the 12-hour evolution cycle."""
     logger.info(f"=== Evolution Cycle {cycle_number} ===")
 
-    # Rank bots by P&L over last 12 hours
+    # Rank bots by P&L over the evolution window
     rankings = []
     for bot in bots:
-        perf = bot.get_performance(hours=12)
+        perf = bot.get_performance(hours=config.EVOLUTION_INTERVAL_HOURS)
         rankings.append({
             "name": bot.name,
             "strategy_type": bot.strategy_type,
@@ -196,6 +196,19 @@ def is_5min_market(question):
     return False
 
 
+def expire_stale_trades():
+    """Expire trades for 5-min markets that are >1h old and never resolved.
+    These fell off Simmer's resolved API before we could check them."""
+    with db.get_conn() as conn:
+        count = conn.execute('''
+            UPDATE trades SET outcome = 'expired', pnl = 0, resolved_at = datetime('now')
+            WHERE outcome IS NULL AND created_at < datetime('now', '-1 hour')
+        ''').rowcount
+    if count > 0:
+        logger.info(f"Expired {count} stale trades (>1h old, never resolved)")
+    return count
+
+
 def resolve_trades(api_key):
     """Check Simmer for resolved markets and update trade outcomes."""
     import requests
@@ -205,7 +218,7 @@ def resolve_trades(api_key):
         # Get pending trades from our DB
         with db.get_conn() as conn:
             pending = conn.execute(
-                "SELECT id, market_id, bot_name, side, amount FROM trades WHERE outcome IS NULL"
+                "SELECT id, market_id, bot_name, side, amount, shares_bought, trade_features FROM trades WHERE outcome IS NULL"
             ).fetchall()
 
         if not pending:
@@ -264,18 +277,27 @@ def resolve_trades(api_key):
 
             outcome = "win" if won else "loss"
 
-            # P&L only for bots that actually had shares (executed the trade)
+            # P&L: win = shares pay $1 each minus cost; loss = lose entire cost
             if shares > 0:
-                pnl = amount if won else -amount
+                pnl = (shares - amount) if won else -amount
             else:
                 pnl = 0  # This bot voted but wasn't the executor
 
             db.resolve_trade(trade["id"], outcome, pnl)
 
-            # ALL bots learn from the outcome (regardless of who executed)
-            market_price = market.get("current_price", 0.5)
-            features = learning.extract_features(market_price, 0.0)
-            learning.record_outcome(trade["bot_name"], features, side, won)
+            # Learn from outcome using features captured AT TRADE TIME (not resolution time)
+            try:
+                stored_features = trade["trade_features"]
+                if stored_features:
+                    features = json.loads(stored_features)
+                else:
+                    # Fallback for old trades without stored features — skip learning
+                    features = None
+            except (KeyError, json.JSONDecodeError):
+                features = None
+
+            if features:
+                learning.record_outcome(trade["bot_name"], features, side, won)
 
             count += 1
 
@@ -367,6 +389,9 @@ def main_loop(bots, api_key):
                     resolve_trades(slot_key)
             else:
                 resolve_trades(api_key)
+
+            # Clean up stale trades that fell off the resolved API
+            expire_stale_trades()
 
             # Discover active markets (any key works for read-only)
             markets = discover_markets(api_key)

@@ -155,7 +155,7 @@ async def get_earnings():
             SELECT date(created_at) as day, COALESCE(SUM(pnl), 0) as pnl,
                    COUNT(*) as trades,
                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
-            FROM trades WHERE outcome IS NOT NULL
+            FROM trades WHERE outcome IN ('win', 'loss')
             GROUP BY date(created_at) ORDER BY day DESC LIMIT 30
         """).fetchall()
 

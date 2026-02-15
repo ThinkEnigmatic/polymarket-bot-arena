@@ -35,9 +35,9 @@ class BaseBot(ABC):
     # How aggressively each strategy trusts the market price signal
     MARKET_PRICE_AGGRESSION = {
         "momentum": 1.2,        # follows market price strongly
-        "mean_reversion": 0.6,  # fades the market price (contrarian)
+        "mean_reversion": 0.95, # nearly follows market (contrarian was -$16 loser)
         "sentiment": 1.0,       # neutral
-        "hybrid": 0.9,          # slightly contrarian
+        "hybrid": 1.0,          # neutral (was 0.9, contrarian loses)
     }
     # Minimum confidence to place a trade (low = trades more, generates learning data)
     MIN_TRADE_CONFIDENCE = {
@@ -136,6 +136,28 @@ class BaseBot(ABC):
         side = "yes" if combined > 0 else "no"
         confidence = min(0.95, abs(combined) * 2)
 
+        # --- Market consensus guard ---
+        # Data shows: betting against strong market consensus is 0-10% WR.
+        # When market strongly favors one side, NEVER bet against it.
+        if market_price > 0.65 and side == "no":
+            return {
+                "action": "skip",
+                "side": side,
+                "confidence": confidence,
+                "reasoning": f"Market consensus guard: price={market_price:.2f} too high to bet NO",
+                "suggested_amount": 0,
+                "features": features,
+            }
+        if market_price < 0.35 and side == "yes":
+            return {
+                "action": "skip",
+                "side": side,
+                "confidence": confidence,
+                "reasoning": f"Market consensus guard: price={market_price:.2f} too low to bet YES",
+                "suggested_amount": 0,
+                "features": features,
+            }
+
         # --- Skip low-confidence trades (no edge = no bet) ---
         min_conf = self.MIN_TRADE_CONFIDENCE.get(self.strategy_type, 0.08)
         if confidence < min_conf:
@@ -149,13 +171,14 @@ class BaseBot(ABC):
             }
 
         # --- Bet sizing: proportional to edge strength ---
+        # Data shows: conf 0.30-0.50 is the sweet spot (67.9% WR, +$48).
+        # conf >0.50 drops to 48.6% WR but bets are bigger → big losses.
+        # Cap bet-sizing confidence at 0.45 to stay in the profitable zone.
+        bet_conf = min(confidence, 0.45)
         max_pos = config.get_max_position()
-        if confidence > 0.5:
-            # Strong edge — bet big (up to 30% of max position)
-            amount = max_pos * (0.10 + confidence * 0.20)
-        elif confidence > 0.2:
-            # Moderate edge
-            amount = max_pos * (0.05 + confidence * 0.10)
+        if bet_conf > 0.2:
+            # Moderate-to-strong edge
+            amount = max_pos * (0.05 + bet_conf * 0.10)
         else:
             # Weak edge — small bet (still generates learning data)
             amount = max_pos * 0.03
@@ -288,6 +311,7 @@ class BaseBot(ABC):
                 reasoning=signal.get("reasoning"),
                 trade_id=result.get("trade_id"),
                 shares_bought=result.get("shares_bought"),
+                trade_features=signal.get("features"),
             )
             logger.info(f"[{self.name}] Paper trade: {signal['side']} ${amount:.2f} on {market.get('question', '')[:50]}")
             return {"success": True, "trade_id": result.get("trade_id")}

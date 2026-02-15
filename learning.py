@@ -117,11 +117,12 @@ def get_learned_bias(bot_name, features, prior_yes=0.5):
         feat_wr = (wins + 1) / (total + 2)  # Laplace smoothing
 
         # Strength of evidence scales with sqrt(observations)
-        strength = min(math.sqrt(total) * 0.3, 2.0)
+        # Stronger pull: ramp up faster so bots adapt quickly
+        strength = min(math.sqrt(total) * 0.5, 3.0)
 
         # Pull log-odds toward observed rate
         feat_log_odds = math.log(feat_wr / (1 - feat_wr))
-        log_odds += feat_log_odds * strength * 0.2
+        log_odds += feat_log_odds * strength * 0.35
 
     # Convert back to probability
     yes_bias = 1.0 / (1.0 + math.exp(-log_odds))
