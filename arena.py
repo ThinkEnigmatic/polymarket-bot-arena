@@ -41,7 +41,34 @@ FAST_POLL_INTERVAL = 0.5  # Poll market prices for SL/TP exits every 0.5s
 
 
 def create_default_bots():
-    """Create the 4 starting bots."""
+    """Create the 4 bots from active DB configs (or defaults for first run)."""
+    active = db.get_active_bots()
+    if active:
+        bot_classes = {
+            "momentum": MomentumBot,
+            "mean_reversion": MeanRevBot,
+            "mean_reversion_sl": MeanRevSLBot,
+            "mean_reversion_tp": MeanRevTPBot,
+            "sentiment": SentimentBot,
+            "hybrid": HybridBot,
+        }
+        bots = []
+        for cfg in active:
+            cls = bot_classes.get(cfg["strategy_type"], MomentumBot)
+            params = cfg["params"]
+            if isinstance(params, str):
+                import json as _j
+                params = _j.loads(params)
+            bots.append(cls(
+                name=cfg["bot_name"],
+                params=params,
+                generation=cfg["generation"],
+                lineage=cfg.get("lineage"),
+            ))
+        if bots:
+            return bots
+
+    # First run fallback
     return [
         MomentumBot(name="momentum-v1", generation=0),
         HybridBot(name="hybrid-v1", generation=0),
@@ -51,10 +78,17 @@ def create_default_bots():
 
 
 def create_evolved_bot(winner, loser_type, gen_number):
-    """Create an evolved bot based on the winner's params."""
-    winner_export = winner.export_params()
-    new_params = winner.mutate(winner_export["params"])
-    name = f"{loser_type}-g{gen_number}-{random.randint(100,999)}"
+    """Create an evolved bot based on the winner's influence + loser's strategy.
+
+    Uses the loser strategy's DEFAULT params as a base, copies over any
+    shared keys from the winner (e.g. lookback_candles, position_size_pct),
+    then mutates. This prevents KeyError when winner and loser have
+    different param schemas.
+    """
+    from bots.bot_momentum import DEFAULT_PARAMS as MOMENTUM_DEFAULTS
+    from bots.bot_mean_rev import DEFAULT_PARAMS as MEANREV_DEFAULTS
+    from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
+    from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
 
     bot_classes = {
         "momentum": MomentumBot,
@@ -64,6 +98,29 @@ def create_evolved_bot(winner, loser_type, gen_number):
         "sentiment": SentimentBot,
         "hybrid": HybridBot,
     }
+
+    default_params_map = {
+        "momentum": MOMENTUM_DEFAULTS,
+        "mean_reversion": MEANREV_DEFAULTS,
+        "mean_reversion_sl": MEANREV_DEFAULTS,
+        "mean_reversion_tp": MEANREV_DEFAULTS,
+        "sentiment": SENTIMENT_DEFAULTS,
+        "hybrid": HYBRID_DEFAULTS,
+    }
+
+    # Start with the target strategy's defaults
+    base_params = default_params_map.get(loser_type, MOMENTUM_DEFAULTS).copy()
+
+    # Copy shared keys from winner (transfers learned tuning for common params)
+    winner_params = winner.export_params()["params"]
+    for key in base_params:
+        if key in winner_params:
+            base_params[key] = winner_params[key]
+
+    # Mutate
+    new_params = winner.mutate(base_params)
+    name = f"{loser_type}-g{gen_number}-{random.randint(100,999)}"
+
     cls = bot_classes.get(loser_type, MomentumBot)
     return cls(
         name=name,
