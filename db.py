@@ -77,6 +77,12 @@ def init_db():
                 UNIQUE(bot_name, feature_key)
             );
 
+            CREATE TABLE IF NOT EXISTS arena_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS copytrading_wallets (
                 address TEXT PRIMARY KEY,
                 label TEXT,
@@ -138,7 +144,7 @@ def resolve_trade(internal_id, outcome, pnl):
 def get_bot_trades(bot_name, hours=None, limit=50):
     with get_conn() as conn:
         if hours:
-            cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
             rows = conn.execute(
                 "SELECT * FROM trades WHERE bot_name=? AND created_at>=? ORDER BY created_at DESC LIMIT ?",
                 (bot_name, cutoff, limit)
@@ -153,16 +159,16 @@ def get_bot_trades(bot_name, hours=None, limit=50):
 
 def get_bot_performance(bot_name, hours=12):
     with get_conn() as conn:
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         row = conn.execute("""
             SELECT
                 COUNT(*) as total_trades,
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses,
+                SUM(CASE WHEN outcome IN ('win', 'exit_tp') THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN outcome IN ('loss', 'exit_sl') THEN 1 ELSE 0 END) as losses,
                 COALESCE(SUM(pnl), 0) as total_pnl,
                 COALESCE(AVG(pnl), 0) as avg_pnl
             FROM trades
-            WHERE bot_name=? AND created_at>=? AND outcome IS NOT NULL
+            WHERE bot_name=? AND created_at>=? AND outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')
         """, (bot_name, cutoff)).fetchone()
         result = dict(row)
         result["wins"] = result["wins"] or 0
@@ -174,16 +180,16 @@ def get_bot_performance(bot_name, hours=12):
 
 def get_all_bots_performance(hours=12):
     with get_conn() as conn:
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         rows = conn.execute("""
             SELECT
                 bot_name,
                 COUNT(*) as total_trades,
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses,
+                SUM(CASE WHEN outcome IN ('win', 'exit_tp') THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN outcome IN ('loss', 'exit_sl') THEN 1 ELSE 0 END) as losses,
                 COALESCE(SUM(pnl), 0) as total_pnl
             FROM trades
-            WHERE created_at>=? AND outcome IS NOT NULL
+            WHERE created_at>=? AND outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')
             GROUP BY bot_name
         """, (cutoff,)).fetchall()
         results = {}
@@ -297,6 +303,23 @@ def get_dashboard_stats():
             "week": dict(week_stats),
             "all_time": dict(all_stats),
         }
+
+
+def get_arena_state(key, default=None):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM arena_state WHERE key=?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+
+
+def set_arena_state(key, value):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO arena_state (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=?, updated_at=datetime('now')""",
+            (key, str(value), str(value))
+        )
 
 
 init_db()

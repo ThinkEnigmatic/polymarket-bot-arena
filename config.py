@@ -45,10 +45,10 @@ MAX_POSITION_PCT_OF_BALANCE = 0.10  # Never bet more than 10% of balance
 MAX_TRADES_PER_HOUR_PER_BOT = 60  # Bots trade every 5-min market they find
 
 # Evolution Settings
-EVOLUTION_INTERVAL_HOURS = 4
+EVOLUTION_INTERVAL_HOURS = 2
 MUTATION_RATE = 0.15  # 15% random adjustment to params
 NUM_BOTS = 4
-SURVIVORS_PER_CYCLE = 2
+SURVIVORS_PER_CYCLE = 1  # Top 1 survives, bottom 3 replaced
 
 # Signal Feed Settings
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"

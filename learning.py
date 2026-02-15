@@ -172,6 +172,77 @@ def record_outcome(bot_name, features, side, won):
                     """, (bot_name, feat))
 
 
+def extract_features_from_reasoning(reasoning):
+    """Try to extract features from the reasoning text of old trades.
+
+    Parses v4-format reasoning like:
+        price=0.50 edge=+0.006 mom=+0.001 strat=+0.000 learn=+0.020(w=60%) => yes conf=0.03
+    Also handles:
+        Forced from hold: market_price=0.505
+    """
+    import re
+    if not reasoning:
+        return None
+
+    market_price = None
+    momentum = None
+
+    # v4 format: price=X.XX ... mom=+X.XXX
+    m = re.search(r'price=([\d.]+)', reasoning)
+    if m:
+        market_price = float(m.group(1))
+    mom_m = re.search(r'mom=([+-]?[\d.]+)', reasoning)
+    if mom_m:
+        momentum = float(mom_m.group(1))
+
+    # Older format: market_price=X.XX
+    if market_price is None:
+        m = re.search(r'market_price=([\d.]+)', reasoning)
+        if m:
+            market_price = float(m.group(1))
+
+    if market_price is not None:
+        return extract_features(market_price, momentum or 0.0)
+    return None
+
+
+def backfill_from_resolved_trades():
+    """Backfill bot_learning from resolved trades that have no trade_features.
+
+    Parses market price from reasoning text to reconstruct features.
+    Only processes trades with outcome='win' or 'loss'.
+    Returns the number of trades backfilled.
+    """
+    with db.get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, bot_name, side, outcome, reasoning, created_at
+            FROM trades
+            WHERE outcome IN ('win', 'loss')
+              AND trade_features IS NULL
+              AND reasoning IS NOT NULL
+        """).fetchall()
+
+    count = 0
+    for r in rows:
+        features = extract_features_from_reasoning(r["reasoning"])
+        if not features:
+            # Last resort: use hour from created_at as the only feature
+            try:
+                hour_utc = int(r["created_at"].split(" ")[1].split(":")[0])
+                hour_et = (hour_utc - 5) % 24
+                features = extract_features(0.5, 0.0, hour_et)  # neutral price bucket
+            except (IndexError, ValueError):
+                continue
+
+        won = r["outcome"] == "win"
+        record_outcome(r["bot_name"], features, r["side"], won)
+        count += 1
+
+    if count > 0:
+        logger.info(f"Backfilled learning from {count} resolved trades")
+    return count
+
+
 def get_bot_learning_summary(bot_name):
     """Get a summary of what the bot has learned."""
     with db.get_conn() as conn:

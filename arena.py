@@ -1,4 +1,4 @@
-"""Bot Arena Manager — runs 4 competing bots with 12-hour evolution cycles."""
+"""Bot Arena Manager — runs 4 competing bots with 2-hour evolution cycles."""
 
 import argparse
 import json
@@ -6,6 +6,7 @@ import logging
 import sys
 import time
 import random
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from bots.bot_momentum import MomentumBot
 from bots.bot_mean_rev import MeanRevBot
 from bots.bot_sentiment import SentimentBot
 from bots.bot_hybrid import HybridBot
+from bots.bot_meanrev_sl import MeanRevSLBot
+from bots.bot_meanrev_tp import MeanRevTPBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
 from signals.orderflow import get_feed as get_orderflow_feed
@@ -33,16 +36,17 @@ logging.basicConfig(
 logger = logging.getLogger("arena")
 
 # Market check interval (seconds)
-TRADE_INTERVAL = 60  # Check markets every 60s
+TRADE_INTERVAL = 60    # Discover markets + place trades every 60s
+FAST_POLL_INTERVAL = 0.5  # Poll market prices for SL/TP exits every 0.5s
 
 
 def create_default_bots():
     """Create the 4 starting bots."""
     return [
         MomentumBot(name="momentum-v1", generation=0),
-        MeanRevBot(name="meanrev-v1", generation=0),
-        SentimentBot(name="sentiment-v1", generation=0),
         HybridBot(name="hybrid-v1", generation=0),
+        MeanRevSLBot(name="meanrev-sl25-v1", generation=0),
+        MeanRevTPBot(name="meanrev-tp2x-v1", generation=0),
     ]
 
 
@@ -55,6 +59,8 @@ def create_evolved_bot(winner, loser_type, gen_number):
     bot_classes = {
         "momentum": MomentumBot,
         "mean_reversion": MeanRevBot,
+        "mean_reversion_sl": MeanRevSLBot,
+        "mean_reversion_tp": MeanRevTPBot,
         "sentiment": SentimentBot,
         "hybrid": HybridBot,
     }
@@ -68,7 +74,7 @@ def create_evolved_bot(winner, loser_type, gen_number):
 
 
 def run_evolution(bots, cycle_number):
-    """Run the 12-hour evolution cycle."""
+    """Run evolution cycle — kill bottom 3, mutate from winner."""
     logger.info(f"=== Evolution Cycle {cycle_number} ===")
 
     # Rank bots by P&L over the evolution window
@@ -218,7 +224,7 @@ def resolve_trades(api_key):
         # Get pending trades from our DB
         with db.get_conn() as conn:
             pending = conn.execute(
-                "SELECT id, market_id, bot_name, side, amount, shares_bought, trade_features FROM trades WHERE outcome IS NULL"
+                "SELECT id, market_id, bot_name, side, amount, shares_bought, trade_features, reasoning FROM trades WHERE outcome IS NULL"
             ).fetchall()
 
         if not pending:
@@ -291,8 +297,12 @@ def resolve_trades(api_key):
                 if stored_features:
                     features = json.loads(stored_features)
                 else:
-                    # Fallback for old trades without stored features — skip learning
-                    features = None
+                    # Fallback: extract features from reasoning text
+                    try:
+                        reasoning = trade["reasoning"]
+                    except (KeyError, IndexError):
+                        reasoning = None
+                    features = learning.extract_features_from_reasoning(reasoning)
             except (KeyError, json.JSONDecodeError):
                 features = None
 
@@ -324,14 +334,199 @@ def assign_bot_slots(bots, bot_keys, default_key):
 
     Slots are named: slot_0, slot_1, slot_2, slot_3
     Each slot maps to a Simmer API key. When a bot is replaced during
-    evolution, the new bot inherits the same slot (and API key).
+    evolution, the new bot inherits the dead bot's slot (and API key).
+    Bots that already have a slot (from evolution inheritance) keep it.
     """
-    slot_names = ["slot_0", "slot_1", "slot_2", "slot_3"]
-    for i, bot in enumerate(bots):
-        slot = slot_names[i] if i < len(slot_names) else slot_names[0]
-        bot._api_key_slot = slot
-        key = bot_keys.get(slot, default_key)
-        logger.info(f"  {bot.name} -> {slot} (key: ...{key[-8:]})")
+    all_slots = ["slot_0", "slot_1", "slot_2", "slot_3"]
+
+    # First pass: collect already-assigned slots
+    used_slots = set()
+    for bot in bots:
+        if hasattr(bot, '_api_key_slot') and bot._api_key_slot:
+            used_slots.add(bot._api_key_slot)
+
+    # Second pass: assign free slots to bots that don't have one
+    free_slots = [s for s in all_slots if s not in used_slots]
+    for bot in bots:
+        if not hasattr(bot, '_api_key_slot') or not bot._api_key_slot:
+            if free_slots:
+                bot._api_key_slot = free_slots.pop(0)
+            else:
+                bot._api_key_slot = all_slots[0]  # fallback
+
+    for bot in bots:
+        key = bot_keys.get(bot._api_key_slot, default_key)
+        logger.info(f"  {bot.name} -> {bot._api_key_slot} (key: ...{key[-8:]})")
+
+
+class PositionMonitorThread(threading.Thread):
+    """Background thread that polls Simmer for market prices every 0.5s.
+
+    Monitors all open positions belonging to bots with exit strategies
+    (stop_loss, take_profit). When a position hits its SL/TP threshold,
+    closes it immediately in the DB and logs the exit.
+
+    The thread fetches active market prices from Simmer in a single API call
+    per tick, then checks all open positions against those prices.
+    """
+
+    def __init__(self, api_key):
+        super().__init__(daemon=True, name="position-monitor")
+        self.api_key = api_key
+        self._bots = {}  # name -> bot instance
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def update_bots(self, bots):
+        """Update the bot roster (called from main thread after evolution)."""
+        with self._lock:
+            self._bots = {b.name: b for b in bots if b.exit_strategy}
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _fetch_market_prices(self):
+        """Fetch current prices for all active markets from Simmer."""
+        import requests
+        try:
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            resp = requests.get(
+                f"{config.SIMMER_BASE_URL}/api/sdk/markets",
+                headers=headers,
+                params={"status": "active", "limit": 100},
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return {}
+            data = resp.json()
+            markets_list = data if isinstance(data, list) else data.get("markets", [])
+            return {
+                (m.get("id") or m.get("market_id")): m.get("current_price")
+                for m in markets_list
+                if m.get("current_price") is not None
+            }
+        except Exception:
+            return {}
+
+    def _check_positions(self, price_map):
+        """Check all open positions for SL/TP exits."""
+        with self._lock:
+            exit_bots = dict(self._bots)
+
+        if not exit_bots:
+            return
+
+        # Get open trades for exit-strategy bots
+        bot_names = list(exit_bots.keys())
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, bot_name, market_id, side, amount, shares_bought, trade_features, reasoning "
+                "FROM trades WHERE outcome IS NULL AND bot_name IN ({})".format(
+                    ",".join("?" for _ in bot_names)
+                ),
+                bot_names,
+            ).fetchall()
+
+        if not rows:
+            return
+
+        for trade in rows:
+            market_id = trade["market_id"]
+            current_yes_price = price_map.get(market_id)
+            if current_yes_price is None:
+                continue
+
+            bot = exit_bots.get(trade["bot_name"])
+            if not bot:
+                continue
+
+            side = trade["side"]
+            amount = trade["amount"]
+            try:
+                shares = trade["shares_bought"] or 0
+            except (KeyError, IndexError):
+                shares = 0
+            if shares <= 0:
+                continue
+
+            entry_price = amount / shares
+
+            if side == "yes":
+                current_share_price = current_yes_price
+            else:
+                current_share_price = 1.0 - current_yes_price
+
+            if entry_price <= 0:
+                continue
+            pnl_pct = (current_share_price - entry_price) / entry_price
+
+            exit_reason = None
+            exit_pnl = None
+
+            if bot.exit_strategy == "stop_loss" and pnl_pct <= -bot.stop_loss_pct:
+                exit_pnl = (current_share_price - entry_price) * shares
+                exit_reason = f"exit_sl ({pnl_pct:+.1%})"
+
+            if bot.exit_strategy == "take_profit" and pnl_pct >= bot.take_profit_pct:
+                exit_pnl = (current_share_price - entry_price) * shares
+                exit_reason = f"exit_tp ({pnl_pct:+.1%})"
+
+            if exit_reason and exit_pnl is not None:
+                outcome = "exit_tp" if "tp" in exit_reason else "exit_sl"
+                db.resolve_trade(trade["id"], outcome, exit_pnl)
+                logger.info(
+                    f"[{trade['bot_name']}] EARLY EXIT: {exit_reason} on {market_id[:12]}... "
+                    f"entry=${entry_price:.3f} now=${current_share_price:.3f} pnl=${exit_pnl:+.2f}"
+                )
+
+                # Feed into learning
+                try:
+                    stored = trade["trade_features"]
+                    if stored:
+                        features = json.loads(stored)
+                    else:
+                        try:
+                            features = learning.extract_features_from_reasoning(trade["reasoning"])
+                        except (KeyError, IndexError):
+                            features = None
+                except (KeyError, json.JSONDecodeError):
+                    features = None
+
+                if features:
+                    won = exit_pnl > 0
+                    learning.record_outcome(trade["bot_name"], features, side, won)
+
+    def run(self):
+        """Main monitor loop — polls every 0.5s."""
+        logger.info(f"Position monitor started (polling every {FAST_POLL_INTERVAL}s)")
+        consecutive_errors = 0
+
+        while not self._stop_event.is_set():
+            try:
+                # Only fetch prices if there are bots to monitor
+                with self._lock:
+                    has_bots = bool(self._bots)
+
+                if has_bots:
+                    price_map = self._fetch_market_prices()
+                    if price_map:
+                        self._check_positions(price_map)
+                        consecutive_errors = 0
+                    else:
+                        consecutive_errors += 1
+
+                # Back off on repeated API failures to avoid hammering Simmer
+                if consecutive_errors > 10:
+                    self._stop_event.wait(5)
+                elif consecutive_errors > 3:
+                    self._stop_event.wait(2)
+                else:
+                    self._stop_event.wait(FAST_POLL_INTERVAL)
+
+            except Exception as e:
+                logger.error(f"Position monitor error: {e}")
+                consecutive_errors += 1
+                self._stop_event.wait(2)
 
 
 def main_loop(bots, api_key):
@@ -344,9 +539,22 @@ def main_loop(bots, api_key):
     sentiment_feed.start()
     orderflow_feed.start()
 
-    cycle_number = 0
-    last_evolution = time.time()
     evolution_interval = config.EVOLUTION_INTERVAL_HOURS * 3600
+
+    # Restore evolution state from DB so it survives restarts
+    saved_cycle = db.get_arena_state("evolution_cycle", "0")
+    cycle_number = int(saved_cycle)
+    saved_last_evo = db.get_arena_state("last_evolution_time")
+    if saved_last_evo:
+        last_evolution = float(saved_last_evo)
+        elapsed = time.time() - last_evolution
+        logger.info(f"Restored evolution timer: cycle {cycle_number}, {elapsed/3600:.1f}h since last evolution")
+    else:
+        last_evolution = time.time()
+        # Persist the initial start so it survives restarts before first evolution
+        db.set_arena_state("last_evolution_time", str(last_evolution))
+        db.set_arena_state("evolution_cycle", "0")
+        logger.info("No saved evolution state, starting fresh timer (persisted)")
 
     # Load recently traded (bot_name, market_id) pairs from DB to prevent
     # duplicate trades across restarts
@@ -372,6 +580,11 @@ def main_loop(bots, api_key):
     logger.info(f"Bots: {[b.name for b in bots]}")
     logger.info(f"Evolution every {config.EVOLUTION_INTERVAL_HOURS}h")
 
+    # Start fast position monitor thread (polls Simmer every 0.5s for SL/TP)
+    pos_monitor = PositionMonitorThread(api_key)
+    pos_monitor.update_bots(bots)
+    pos_monitor.start()
+
     while True:
         try:
             # Check for evolution
@@ -379,9 +592,14 @@ def main_loop(bots, api_key):
                 cycle_number += 1
                 bots = run_evolution(bots, cycle_number)
                 last_evolution = time.time()
+                # Persist evolution state so it survives restarts
+                db.set_arena_state("evolution_cycle", str(cycle_number))
+                db.set_arena_state("last_evolution_time", str(last_evolution))
                 traded.clear()
                 # Re-assign slots — new bots inherit the killed bot's slot index
                 assign_bot_slots(bots, bot_keys, api_key)
+                # Update position monitor with new bot roster
+                pos_monitor.update_bots(bots)
 
             # Resolve completed trades (check all accounts)
             if multi_account:
@@ -397,6 +615,7 @@ def main_loop(bots, api_key):
             markets = discover_markets(api_key)
             if not markets:
                 logger.debug("No active 5-min markets found, waiting...")
+                # Position monitor thread handles SL/TP independently
                 time.sleep(30)
                 continue
 
@@ -445,6 +664,7 @@ def main_loop(bots, api_key):
             if new_trades > 0:
                 logger.info(f"Placed {new_trades} new trades this cycle")
 
+            # Position monitor thread polls Simmer every 0.5s for SL/TP
             time.sleep(TRADE_INTERVAL)
 
         except KeyboardInterrupt:
@@ -488,6 +708,11 @@ def main():
     for bot in bots:
         if bot.name not in existing:
             db.save_bot_config(bot.name, bot.strategy_type, bot.generation, bot.strategy_params)
+
+    # Backfill learning data from old resolved trades that had no trade_features
+    backfilled = learning.backfill_from_resolved_trades()
+    if backfilled:
+        logger.info(f"Backfilled learning from {backfilled} historical trades")
 
     main_loop(bots, api_key)
 

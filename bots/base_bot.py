@@ -24,11 +24,20 @@ class BaseBot(ABC):
     generation: int
     lineage: str
 
+    # Exit strategy: None = hold to resolution (default)
+    # "stop_loss" = exit when position is down stop_loss_pct
+    # "take_profit" = exit when position is up take_profit_pct
+    exit_strategy: str = None
+    stop_loss_pct: float = 0.0
+    take_profit_pct: float = 0.0
+
     # Each strategy type gets different parameters for differentiation.
     # This creates real competition for evolution to select from.
     STRATEGY_PRIORS = {
         "momentum": 0.52,       # slight YES bias — momentum tends bullish
         "mean_reversion": 0.48, # slight NO bias — mean reversion bets against crowd
+        "mean_reversion_sl": 0.48,
+        "mean_reversion_tp": 0.48,
         "sentiment": 0.50,      # neutral
         "hybrid": 0.50,         # neutral
     }
@@ -36,6 +45,8 @@ class BaseBot(ABC):
     MARKET_PRICE_AGGRESSION = {
         "momentum": 1.2,        # follows market price strongly
         "mean_reversion": 0.95, # nearly follows market (contrarian was -$16 loser)
+        "mean_reversion_sl": 0.95,
+        "mean_reversion_tp": 0.95,
         "sentiment": 1.0,       # neutral
         "hybrid": 1.0,          # neutral (was 0.9, contrarian loses)
     }
@@ -43,6 +54,8 @@ class BaseBot(ABC):
     MIN_TRADE_CONFIDENCE = {
         "momentum": 0.01,       # trades almost everything (aggressive learner)
         "mean_reversion": 0.06, # slightly selective
+        "mean_reversion_sl": 0.06,
+        "mean_reversion_tp": 0.06,
         "sentiment": 0.03,      # moderate
         "hybrid": 0.05,         # moderate-selective
     }
