@@ -85,18 +85,23 @@ class BaseBot(ABC):
         prior = self.STRATEGY_PRIORS.get(self.strategy_type, 0.5)
         learned_yes_bias = learning.get_learned_bias(self.name, features, prior)
 
+        # Dynamic weighting: as we accumulate data, trust learning more
+        # Start at 40% learning, ramp to 80% after 50+ resolved trades
+        perf = db.get_bot_performance(self.name, hours=168)  # last 7 days
+        total_resolved = perf.get("total_trades", 0)
+        learning_weight = min(0.80, 0.40 + total_resolved * 0.008)
+        strategy_weight = 1.0 - learning_weight
+
         # Combine strategy signal with learned bias
         if raw_signal["action"] != "hold":
-            # Strategy has an opinion — weight it 60% strategy, 40% learning
             strategy_yes = 1.0 if raw_signal["side"] == "yes" else 0.0
             strategy_conf = raw_signal["confidence"]
-            # Blend: strategy opinion weighted by its confidence + learned bias
             combined_yes = (
-                strategy_yes * strategy_conf * 0.6 +
-                learned_yes_bias * 0.4 +
-                (1 - strategy_conf) * 0.5 * 0.6  # uncertainty pulls to neutral
+                strategy_yes * strategy_conf * strategy_weight +
+                learned_yes_bias * learning_weight +
+                (1 - strategy_conf) * 0.5 * strategy_weight
             )
-            reasoning = f"{raw_signal.get('reasoning', '')} | learned_bias={learned_yes_bias:.2f}"
+            reasoning = f"{raw_signal.get('reasoning', '')} | learned={learned_yes_bias:.2f} w={learning_weight:.0%}"
         else:
             # Strategy says hold — rely entirely on learned bias
             combined_yes = learned_yes_bias
@@ -283,5 +288,17 @@ class BaseBot(ABC):
 
     def _load_api_key(self):
         import json as _json
+        # Try per-bot key first, then fall back to default
+        try:
+            with open(config.SIMMER_BOT_KEYS_PATH) as f:
+                bot_keys = _json.load(f)
+            if self.name in bot_keys:
+                return bot_keys[self.name]
+            # Check by slot assignment (for evolved bots inheriting a slot)
+            if hasattr(self, '_api_key_slot') and self._api_key_slot in bot_keys:
+                return bot_keys[self._api_key_slot]
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        # Fallback: default key
         with open(config.SIMMER_API_KEY_PATH) as f:
             return _json.load(f).get("api_key")
