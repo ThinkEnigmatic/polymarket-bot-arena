@@ -1,0 +1,27 @@
+# Credentials & secrets
+credentials.json
+*.key
+*.pem
+
+# Database & state
+*.db
+*.sqlite
+*.jsonl
+
+# Logs
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.egg-info/
+
+# Runtime
+bots/evolved/*.json
+setup_log.md
+
+# OS
+.DS_Store
