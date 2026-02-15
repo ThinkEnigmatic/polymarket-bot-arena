@@ -400,11 +400,17 @@ def main_loop(bots, api_key):
 
                     try:
                         signal = bot.make_decision(market, combined_signals)
+
+                        # Skip if bot sees no edge
+                        if signal.get("action") == "skip":
+                            traded.add(key)
+                            continue
+
                         result = bot.execute(signal, market)
                         traded.add(key)
                         if result.get("success"):
                             new_trades += 1
-                            logger.info(f"[{bot.name}] {signal['side'].upper()} (conf={signal['confidence']:.2f}) on {market.get('question', '')[:50]}")
+                            logger.info(f"[{bot.name}] {signal['side'].upper()} ${signal['suggested_amount']:.2f} (conf={signal['confidence']:.2f}) on {market.get('question', '')[:50]}")
                         else:
                             logger.debug(f"[{bot.name}] Trade failed on {market_id}: {result.get('reason')}")
                     except Exception as e:
