@@ -263,25 +263,29 @@ def get_dashboard_stats():
         today = datetime.utcnow().strftime("%Y-%m-%d")
         week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
 
+        # Exclude phantom trades (pnl=0 resolved from voting era)
         today_stats = conn.execute("""
             SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                   SUM(CASE WHEN pnl <= 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
+                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
             FROM trades WHERE date(created_at)=?
+                AND NOT (outcome IS NOT NULL AND pnl = 0)
         """, (today,)).fetchone()
 
         week_stats = conn.execute("""
             SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                   SUM(CASE WHEN pnl <= 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
+                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
             FROM trades WHERE created_at>=?
+                AND NOT (outcome IS NOT NULL AND pnl = 0)
         """, (week_ago,)).fetchone()
 
         all_stats = conn.execute("""
             SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                   SUM(CASE WHEN pnl <= 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
+                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
             FROM trades
+                WHERE NOT (outcome IS NOT NULL AND pnl = 0)
         """).fetchone()
 
         return {

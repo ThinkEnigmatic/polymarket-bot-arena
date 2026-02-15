@@ -124,9 +124,10 @@ async def get_trades(bot: str = None, limit: int = 50):
     if bot:
         return JSONResponse(db.get_bot_trades(bot, limit=limit))
     with db.get_conn() as conn:
-        # Show resolved trades first (with P&L), then pending
+        # Show trades with real P&L first, then pending. Skip phantom pnl=0 resolved trades.
         rows = conn.execute(
             """SELECT * FROM trades
+               WHERE NOT (outcome IS NOT NULL AND (pnl IS NULL OR pnl = 0))
                ORDER BY
                    CASE WHEN outcome IS NOT NULL THEN 0 ELSE 1 END,
                    resolved_at DESC, created_at DESC

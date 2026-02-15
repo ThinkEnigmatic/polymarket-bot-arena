@@ -24,13 +24,27 @@ class BaseBot(ABC):
     generation: int
     lineage: str
 
-    # Each strategy type gets a different prior bias.
-    # This makes bots differentiated from the start.
+    # Each strategy type gets different parameters for differentiation.
+    # This creates real competition for evolution to select from.
     STRATEGY_PRIORS = {
-        "momentum": 0.5,        # neutral — learns from momentum signals
-        "mean_reversion": 0.5,  # neutral — learns from reversion signals
-        "sentiment": 0.5,       # neutral — learns from sentiment
-        "hybrid": 0.5,          # neutral — combines learned biases
+        "momentum": 0.52,       # slight YES bias — momentum tends bullish
+        "mean_reversion": 0.48, # slight NO bias — mean reversion bets against crowd
+        "sentiment": 0.50,      # neutral
+        "hybrid": 0.50,         # neutral
+    }
+    # How aggressively each strategy trusts the market price signal
+    MARKET_PRICE_AGGRESSION = {
+        "momentum": 1.2,        # follows market price strongly
+        "mean_reversion": 0.6,  # fades the market price (contrarian)
+        "sentiment": 1.0,       # neutral
+        "hybrid": 0.9,          # slightly contrarian
+    }
+    # Minimum confidence to place a trade (low = trades more, generates learning data)
+    MIN_TRADE_CONFIDENCE = {
+        "momentum": 0.01,       # trades almost everything (aggressive learner)
+        "mean_reversion": 0.06, # slightly selective
+        "sentiment": 0.03,      # moderate
+        "hybrid": 0.05,         # moderate-selective
     }
 
     def __init__(self, name, strategy_type, params, generation=0, lineage=None):
@@ -57,66 +71,101 @@ class BaseBot(ABC):
         pass
 
     def make_decision(self, market: dict, signals: dict) -> dict:
-        """Make a trading decision using strategy analysis + learned bias.
+        """Make a trading decision using market price edge + strategy + learning.
 
-        This is the main entry point. It:
-        1. Gets the strategy's raw analysis
-        2. Extracts market features
-        3. Queries learned win rates for those features
-        4. Combines strategy signal with learned bias
-        5. Always returns a trade (never hold)
+        Signal hierarchy:
+        1. Market price edge (strongest — when price is far from 50c, follow it)
+        2. BTC momentum (if price is moving, lean that direction)
+        3. Strategy analysis (adds differentiation between bots)
+        4. Learned bias (accumulates over time, adjusts everything)
+
+        Skips trades when confidence is too low (no edge = no bet).
         """
-        # Get strategy's raw signal
-        raw_signal = self.analyze(market, signals)
-
-        # Extract features for learning
         market_price = market.get("current_price", 0.5)
+
+        # --- Signal 1: Market price edge ---
+        # When YES is priced high, YES usually wins. The further from 50c, the stronger.
+        aggression = self.MARKET_PRICE_AGGRESSION.get(self.strategy_type, 1.0)
+        price_edge = (market_price - 0.5) * aggression
+        # price_edge > 0 means lean YES, < 0 means lean NO
+
+        # --- Signal 2: BTC momentum ---
         prices = signals.get("prices", [])
-        if len(prices) >= 2:
+        btc_latest = signals.get("latest", 0)
+        price_momentum = 0.0
+        if len(prices) >= 2 and prices[-1] > 0:
             price_momentum = (prices[-1] - prices[-2]) / prices[-2]
-        elif len(prices) == 1 and prices[0] > 0:
-            price_momentum = 0.0
-        else:
-            price_momentum = 0.0
+        elif btc_latest > 0 and len(prices) >= 1 and prices[-1] > 0:
+            # Use live price vs last closed candle
+            price_momentum = (btc_latest - prices[-1]) / prices[-1]
+        elif btc_latest > 0 and len(prices) == 0:
+            # No candles yet — use market price direction as weak proxy
+            # Market price > 0.5 suggests BTC trending up in this window
+            price_momentum = (market_price - 0.5) * 0.005
+        # Momentum signal: BTC going up → lean YES
+        momentum_signal = max(-0.15, min(0.15, price_momentum * 30))
 
+        # --- Signal 3: Strategy analysis ---
+        raw_signal = self.analyze(market, signals)
+        strategy_signal = 0.0
+        if raw_signal["action"] != "hold":
+            strategy_yes = 1.0 if raw_signal["side"] == "yes" else -1.0
+            strategy_signal = strategy_yes * raw_signal["confidence"] * 0.15
+
+        # --- Signal 4: Learning bias ---
         features = learning.extract_features(market_price, price_momentum)
-
-        # Get learned bias (how much to lean YES based on past outcomes)
         prior = self.STRATEGY_PRIORS.get(self.strategy_type, 0.5)
         learned_yes_bias = learning.get_learned_bias(self.name, features, prior)
+        # Convert from 0-1 to -0.5 to +0.5
+        learning_signal = (learned_yes_bias - 0.5)
 
-        # Dynamic weighting: as we accumulate data, trust learning more
-        # Start at 40% learning, ramp to 80% after 50+ resolved trades
-        perf = db.get_bot_performance(self.name, hours=168)  # last 7 days
+        # Dynamic learning weight: ramps up as bot accumulates data
+        perf = db.get_bot_performance(self.name, hours=168)
         total_resolved = perf.get("total_trades", 0)
-        learning_weight = min(0.80, 0.40 + total_resolved * 0.008)
-        strategy_weight = 1.0 - learning_weight
+        learning_weight = min(0.6, 0.1 + total_resolved * 0.01)
 
-        # Combine strategy signal with learned bias
-        if raw_signal["action"] != "hold":
-            strategy_yes = 1.0 if raw_signal["side"] == "yes" else 0.0
-            strategy_conf = raw_signal["confidence"]
-            combined_yes = (
-                strategy_yes * strategy_conf * strategy_weight +
-                learned_yes_bias * learning_weight +
-                (1 - strategy_conf) * 0.5 * strategy_weight
-            )
-            reasoning = f"{raw_signal.get('reasoning', '')} | learned={learned_yes_bias:.2f} w={learning_weight:.0%}"
-        else:
-            # Strategy says hold — rely entirely on learned bias
-            combined_yes = learned_yes_bias
-            reasoning = f"Learning-driven: yes_bias={learned_yes_bias:.2f}, features={features}"
+        # --- Combine all signals ---
+        combined = (
+            price_edge * 0.50 +           # Market price is primary signal
+            momentum_signal * 0.20 +       # BTC momentum is secondary
+            strategy_signal * 0.15 +       # Strategy adds differentiation
+            learning_signal * learning_weight  # Learning grows over time
+        )
+        # combined > 0 → YES, < 0 → NO
 
-        # Convert to side + confidence
-        side = "yes" if combined_yes > 0.5 else "no"
-        confidence = abs(combined_yes - 0.5) * 2  # 0-1 scale
-        confidence = max(0.1, min(0.95, confidence))
+        side = "yes" if combined > 0 else "no"
+        confidence = min(0.95, abs(combined) * 2)
 
-        # Scale bet size by confidence: high confidence = bigger bet
+        # --- Skip low-confidence trades (no edge = no bet) ---
+        min_conf = self.MIN_TRADE_CONFIDENCE.get(self.strategy_type, 0.08)
+        if confidence < min_conf:
+            return {
+                "action": "skip",
+                "side": side,
+                "confidence": confidence,
+                "reasoning": f"No edge: conf={confidence:.3f} < {min_conf} | price={market_price:.2f}",
+                "suggested_amount": 0,
+                "features": features,
+            }
+
+        # --- Bet sizing: proportional to edge strength ---
         max_pos = config.get_max_position()
-        min_bet = max_pos * 0.02  # 2% minimum
-        max_bet = max_pos * 0.10  # 10% maximum
-        amount = min_bet + (max_bet - min_bet) * confidence
+        if confidence > 0.5:
+            # Strong edge — bet big (up to 30% of max position)
+            amount = max_pos * (0.10 + confidence * 0.20)
+        elif confidence > 0.2:
+            # Moderate edge
+            amount = max_pos * (0.05 + confidence * 0.10)
+        else:
+            # Weak edge — small bet (still generates learning data)
+            amount = max_pos * 0.03
+
+        reasoning = (
+            f"price={market_price:.2f} edge={price_edge:+.3f} "
+            f"mom={momentum_signal:+.3f} strat={strategy_signal:+.3f} "
+            f"learn={learning_signal:+.3f}(w={learning_weight:.0%}) "
+            f"=> {side} conf={confidence:.2f}"
+        )
 
         return {
             "action": "buy",
@@ -124,7 +173,7 @@ class BaseBot(ABC):
             "confidence": confidence,
             "reasoning": reasoning,
             "suggested_amount": amount,
-            "features": features,  # Pass through for learning updates
+            "features": features,
         }
 
     def execute(self, signal: dict, market: dict) -> dict:
