@@ -109,6 +109,10 @@ def run_evolution(bots, cycle_number):
     for dead_bot in replaced:
         parent = random.choice(winners)
         evolved = create_evolved_bot(parent, dead_bot.strategy_type, cycle_number)
+        # Inherit the dead bot's API key slot so evolved bot uses same Simmer account
+        if hasattr(dead_bot, '_api_key_slot'):
+            evolved._api_key_slot = dead_bot._api_key_slot
+            logger.info(f"  {evolved.name} inherits slot {dead_bot._api_key_slot} from {dead_bot.name}")
         db.retire_bot(dead_bot.name)
         db.save_bot_config(
             evolved.name, evolved.strategy_type, evolved.generation,
@@ -247,20 +251,28 @@ def resolve_trades(api_key):
 
             side = trade["side"]
             amount = trade["amount"]
+            try:
+                shares = trade["shares_bought"] or 0
+            except (IndexError, KeyError):
+                shares = 0
 
-            # Did our side win?
+            # Did this bot's voted side win?
             if side == "yes":
                 won = market_outcome is True
             else:
                 won = market_outcome is False
 
             outcome = "win" if won else "loss"
-            # P&L: win = +amount (profit on shares), loss = -amount (lost bet)
-            pnl = amount if won else -amount
+
+            # P&L only for bots that actually had shares (executed the trade)
+            if shares > 0:
+                pnl = amount if won else -amount
+            else:
+                pnl = 0  # This bot voted but wasn't the executor
 
             db.resolve_trade(trade["id"], outcome, pnl)
 
-            # Feed learning engine with outcome
+            # ALL bots learn from the outcome (regardless of who executed)
             market_price = market.get("current_price", 0.5)
             features = learning.extract_features(market_price, 0.0)
             learning.record_outcome(trade["bot_name"], features, side, won)
@@ -276,8 +288,32 @@ def resolve_trades(api_key):
         return 0
 
 
+def load_bot_keys():
+    """Load per-bot API keys. Returns dict of bot_name -> api_key."""
+    try:
+        with open(config.SIMMER_BOT_KEYS_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def assign_bot_slots(bots, bot_keys, default_key):
+    """Assign each bot to a Simmer account slot.
+
+    Slots are named: slot_0, slot_1, slot_2, slot_3
+    Each slot maps to a Simmer API key. When a bot is replaced during
+    evolution, the new bot inherits the same slot (and API key).
+    """
+    slot_names = ["slot_0", "slot_1", "slot_2", "slot_3"]
+    for i, bot in enumerate(bots):
+        slot = slot_names[i] if i < len(slot_names) else slot_names[0]
+        bot._api_key_slot = slot
+        key = bot_keys.get(slot, default_key)
+        logger.info(f"  {bot.name} -> {slot} (key: ...{key[-8:]})")
+
+
 def main_loop(bots, api_key):
-    """Main trading loop."""
+    """Main trading loop — each bot trades independently on its own Simmer account."""
     price_feed = get_price_feed()
     sentiment_feed = get_sentiment_feed()
     orderflow_feed = get_orderflow_feed()
@@ -290,8 +326,25 @@ def main_loop(bots, api_key):
     last_evolution = time.time()
     evolution_interval = config.EVOLUTION_INTERVAL_HOURS * 3600
 
-    # Track which (bot_name, market_id) pairs have been traded
+    # Load recently traded (bot_name, market_id) pairs from DB to prevent
+    # duplicate trades across restarts
     traded = set()
+    with db.get_conn() as conn:
+        recent = conn.execute(
+            "SELECT bot_name, market_id FROM trades WHERE created_at >= datetime('now', '-6 hours')"
+        ).fetchall()
+        for r in recent:
+            traded.add((r["bot_name"], r["market_id"]))
+    logger.info(f"Loaded {len(traded)} recent trade keys from DB (dedup across restarts)")
+
+    # Load per-bot API keys and assign slots
+    bot_keys = load_bot_keys()
+    assign_bot_slots(bots, bot_keys, api_key)
+    multi_account = len(bot_keys) >= config.NUM_BOTS
+    if multi_account:
+        logger.info(f"Multi-account mode: {len(bot_keys)} Simmer accounts loaded")
+    else:
+        logger.info(f"Single-account mode: {len(bot_keys)} bot keys found (need {config.NUM_BOTS} for independent trading)")
 
     logger.info(f"Arena started with {len(bots)} bots in {config.get_current_mode()} mode")
     logger.info(f"Bots: {[b.name for b in bots]}")
@@ -304,12 +357,18 @@ def main_loop(bots, api_key):
                 cycle_number += 1
                 bots = run_evolution(bots, cycle_number)
                 last_evolution = time.time()
-                traded.clear()  # Reset traded set after evolution
+                traded.clear()
+                # Re-assign slots — new bots inherit the killed bot's slot index
+                assign_bot_slots(bots, bot_keys, api_key)
 
-            # Resolve completed trades
-            resolve_trades(api_key)
+            # Resolve completed trades (check all accounts)
+            if multi_account:
+                for slot_key in set(bot_keys.values()):
+                    resolve_trades(slot_key)
+            else:
+                resolve_trades(api_key)
 
-            # Discover active markets
+            # Discover active markets (any key works for read-only)
             markets = discover_markets(api_key)
             if not markets:
                 logger.debug("No active 5-min markets found, waiting...")
@@ -333,25 +392,24 @@ def main_loop(bots, api_key):
                 of_signals = orderflow_feed.get_signals(market_id, api_key)
                 combined_signals = {**price_signals, **sent_signals, **of_signals}
 
-                # Every bot MUST trade every market exactly once
+                # Each bot trades independently on its own account
                 for bot in bots:
                     key = (bot.name, market_id)
                     if key in traded:
-                        continue  # Already traded this market
+                        continue
 
                     try:
-                        # Use make_decision() which combines strategy + learned bias
                         signal = bot.make_decision(market, combined_signals)
                         result = bot.execute(signal, market)
                         traded.add(key)
                         if result.get("success"):
                             new_trades += 1
-                            logger.info(f"[{bot.name}] Traded {signal['side']} (conf={signal['confidence']:.2f}) on {market.get('question', '')[:50]}")
+                            logger.info(f"[{bot.name}] {signal['side'].upper()} (conf={signal['confidence']:.2f}) on {market.get('question', '')[:50]}")
                         else:
                             logger.debug(f"[{bot.name}] Trade failed on {market_id}: {result.get('reason')}")
                     except Exception as e:
                         logger.error(f"[{bot.name}] Error on {market_id}: {e}")
-                        traded.add(key)  # Don't retry failed markets
+                        traded.add(key)
 
             if new_trades > 0:
                 logger.info(f"Placed {new_trades} new trades this cycle")

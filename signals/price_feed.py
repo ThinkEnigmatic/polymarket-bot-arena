@@ -17,6 +17,7 @@ class PriceFeed:
         self.prices = {sym: deque(maxlen=max_candles) for sym in SYMBOLS}
         self.volumes = {sym: deque(maxlen=max_candles) for sym in SYMBOLS}
         self.latest = {sym: 0.0 for sym in SYMBOLS}
+        self._last_update = {sym: 0.0 for sym in SYMBOLS}
         self._running = False
         self._thread = None
 
@@ -62,6 +63,7 @@ class PriceFeed:
                         for name, binance_sym in SYMBOLS.items():
                             if symbol == binance_sym:
                                 self.latest[name] = close
+                                self._last_update[name] = time.time()
                                 if is_closed:
                                     self.prices[name].append(close)
                                     self.volumes[name].append(volume)
@@ -80,10 +82,12 @@ class PriceFeed:
         if sym not in self.prices:
             return {"prices": [], "volumes": [], "latest": 0}
 
+        stale = (time.time() - self._last_update.get(sym, 0)) > 60
         return {
             "prices": list(self.prices[sym]),
             "volumes": list(self.volumes[sym]),
             "latest": self.latest.get(sym, 0),
+            "stale": stale,
         }
 
 
