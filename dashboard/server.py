@@ -100,11 +100,19 @@ async def get_bots():
         perf_12h = db.get_bot_performance(cfg["bot_name"], hours=12)
         perf_24h = db.get_bot_performance(cfg["bot_name"], hours=24)
         trades = db.get_bot_trades(cfg["bot_name"], limit=10)
+        # Count pending (unresolved) trades so dashboard shows activity
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) as c FROM trades WHERE bot_name=? AND outcome IS NULL",
+                (cfg["bot_name"],)
+            ).fetchone()
+            pending_count = dict(row)["c"]
         result.append({
             "config": cfg,
             "performance_12h": perf_12h,
             "performance_24h": perf_24h,
             "recent_trades": trades,
+            "pending_trades": pending_count,
         })
     return JSONResponse(result)
 

@@ -104,7 +104,7 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
     <div class="section-title">Evolution History</div>
     <div class="card" id="evolution-card">
         <table id="evolution-table">
-            <thead><tr><th>Cycle</th><th>Survivors</th><th>Replaced</th><th>New Bots</th><th>Time</th></tr></thead>
+            <thead><tr><th>Cycle</th><th>Survivors</th><th>Killed (WR / P&L)</th><th>New Bots</th><th>Time</th></tr></thead>
             <tbody></tbody>
         </table>
     </div>
@@ -186,6 +186,7 @@ function updateBots(bots) {
         const trades = bot.recent_trades || [];
         const params = typeof cfg.params === 'string' ? JSON.parse(cfg.params) : cfg.params;
 
+        const pending = bot.pending_trades || 0;
         const card = document.createElement('div');
         card.className = 'card bot-card' + (i < 2 ? ' top' : '');
         card.innerHTML = `
@@ -193,7 +194,7 @@ function updateBots(bots) {
             <div class="bot-meta">${cfg.strategy_type} | Gen ${cfg.generation} | ${cfg.lineage || '-'}</div>
             <div class="stat-row"><span class="stat-label">12h P&L</span><span class="stat-value ${pnlClass(p12.total_pnl)}">${fmtPnl(p12.total_pnl || 0)}</span></div>
             <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value">${winRate(p12.wins, p12.losses)}</span></div>
-            <div class="stat-row"><span class="stat-label">Trades (12h)</span><span class="stat-value">${p12.total_trades || 0}</span></div>
+            <div class="stat-row"><span class="stat-label">Trades (12h)</span><span class="stat-value">${p12.total_trades || 0}${pending ? ' <span style="color:#f0883e">+' + pending + ' pending</span>' : ''}</span></div>
             <div class="trade-list">${trades.slice(0, 5).map(t => `
                 <div class="trade-item">
                     <span>${t.side} ${(t.market_question || '').slice(0, 30)}</span>
@@ -207,15 +208,23 @@ function updateBots(bots) {
 
 function updateEvolution(events) {
     const tbody = document.querySelector('#evolution-table tbody');
-    tbody.innerHTML = events.map(e => `
-        <tr>
+    tbody.innerHTML = events.map(e => {
+        // Build killed bots display with WR and P&L from rankings
+        const rankings = e.rankings || [];
+        const replaced = e.replaced || [];
+        const killedInfo = replaced.map(name => {
+            const r = rankings.find(x => x.name === name);
+            if (r) return `${name} <span class="neutral">(${(r.win_rate * 100).toFixed(0)}% ${fmtPnl(r.pnl)})</span>`;
+            return name;
+        }).join(', ');
+        return `<tr>
             <td>#${e.cycle_number}</td>
             <td>${(e.survivors || []).join(', ')}</td>
-            <td>${(e.replaced || []).join(', ')}</td>
+            <td>${killedInfo}</td>
             <td>${(e.new_bots || []).join(', ')}</td>
-            <td>${e.created_at || ''}</td>
-        </tr>
-    `).join('');
+            <td>${(e.created_at || '').slice(0, 16)}</td>
+        </tr>`;
+    }).join('');
 }
 
 function updateTrades(trades) {
