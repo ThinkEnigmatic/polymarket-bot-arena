@@ -130,6 +130,19 @@ def create_evolved_bot(winner, loser_type, gen_number):
     )
 
 
+def _validate_bot(bot):
+    """Smoke-test a bot by running make_decision with dummy data.
+    Returns True if bot can trade, False if it crashes."""
+    dummy_market = {"current_price": 0.52, "id": "test", "question": "test"}
+    dummy_signals = {"prices": [97000, 97050, 97100], "latest": 97100}
+    try:
+        result = bot.make_decision(dummy_market, dummy_signals)
+        return result.get("action") in ("buy", "skip")
+    except Exception as e:
+        logger.error(f"  VALIDATION FAILED for {bot.name}: {e}")
+        return False
+
+
 def run_evolution(bots, cycle_number):
     """Run evolution cycle — kill bottom 3, mutate from winner."""
     logger.info(f"=== Evolution Cycle {cycle_number} ===")
@@ -153,9 +166,6 @@ def run_evolution(bots, cycle_number):
         status = "SURVIVES" if i < config.SURVIVORS_PER_CYCLE else "REPLACED"
         logger.info(f"  #{i+1} {r['name']}: P&L=${r['pnl']:.2f}, WR={r['win_rate']:.1%}, Trades={r['trades']} [{status}]")
 
-    # Survivors
-    survivors = bots[:2] if rankings[0]["name"] == bots[0].name else []
-    # Actually match by name
     survivor_names = {rankings[i]["name"] for i in range(config.SURVIVORS_PER_CYCLE)}
     replaced_names = {rankings[i]["name"] for i in range(config.SURVIVORS_PER_CYCLE, len(rankings))}
 
@@ -172,20 +182,43 @@ def run_evolution(bots, cycle_number):
     for dead_bot in replaced:
         parent = random.choice(winners)
         evolved = create_evolved_bot(parent, dead_bot.strategy_type, cycle_number)
+
         # Inherit the dead bot's API key slot so evolved bot uses same Simmer account
         if hasattr(dead_bot, '_api_key_slot'):
             evolved._api_key_slot = dead_bot._api_key_slot
             logger.info(f"  {evolved.name} inherits slot {dead_bot._api_key_slot} from {dead_bot.name}")
+
+        # Validate the new bot can actually trade before committing
+        if not _validate_bot(evolved):
+            logger.warning(f"  {evolved.name} failed validation, recreating with pure defaults")
+            from bots.bot_momentum import DEFAULT_PARAMS as MOMENTUM_DEFAULTS
+            from bots.bot_mean_rev import DEFAULT_PARAMS as MEANREV_DEFAULTS
+            from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
+            from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
+            fallback_map = {
+                "momentum": MOMENTUM_DEFAULTS, "mean_reversion": MEANREV_DEFAULTS,
+                "mean_reversion_sl": MEANREV_DEFAULTS, "mean_reversion_tp": MEANREV_DEFAULTS,
+                "sentiment": SENTIMENT_DEFAULTS, "hybrid": HYBRID_DEFAULTS,
+            }
+            bot_classes = {
+                "momentum": MomentumBot, "mean_reversion": MeanRevBot,
+                "mean_reversion_sl": MeanRevSLBot, "mean_reversion_tp": MeanRevTPBot,
+                "sentiment": SentimentBot, "hybrid": HybridBot,
+            }
+            cls = bot_classes.get(dead_bot.strategy_type, MomentumBot)
+            fallback_params = fallback_map.get(dead_bot.strategy_type, MOMENTUM_DEFAULTS).copy()
+            evolved = cls(
+                name=evolved.name, params=fallback_params,
+                generation=cycle_number, lineage=f"{parent.name} -> {evolved.name} (fallback)",
+            )
+            if hasattr(dead_bot, '_api_key_slot'):
+                evolved._api_key_slot = dead_bot._api_key_slot
+
         db.retire_bot(dead_bot.name)
         db.save_bot_config(
             evolved.name, evolved.strategy_type, evolved.generation,
             evolved.strategy_params, evolved.lineage
         )
-        # Save evolved params to file
-        evolved_dir = Path(__file__).parent / "bots" / "evolved"
-        evolved_dir.mkdir(exist_ok=True)
-        with open(evolved_dir / f"{evolved.name}.json", "w") as f:
-            json.dump(evolved.export_params(), f, indent=2)
 
         new_bots.append(evolved)
         logger.info(f"  Created {evolved.name} (from {parent.name}): {json.dumps(evolved.strategy_params)[:200]}")
@@ -198,6 +231,11 @@ def run_evolution(bots, cycle_number):
         [b.name for b in new_bots if b.name not in survivor_names],
         rankings,
     )
+
+    # Final validation: confirm all bots have API slots and can trade
+    for bot in new_bots:
+        slot = getattr(bot, '_api_key_slot', None)
+        logger.info(f"  Post-evolution: {bot.name} ({bot.strategy_type}) slot={slot} params_keys={list(bot.strategy_params.keys())}")
 
     return new_bots
 
