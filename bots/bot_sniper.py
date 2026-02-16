@@ -152,9 +152,18 @@ class SniperBot(BaseBot):
                 "suggested_amount": 0, "features": features,
             }
 
+        # --- Early-window boost ---
+        window_age = market.get("window_age_seconds")
+        if window_age is not None and window_age < 90:
+            confidence *= 1.25
+            confidence = min(0.95, confidence)
+            reasoning_parts.append(f"early-window-boost(age={window_age:.0f}s)")
+
         # --- Position sizing ---
         max_pos = config.get_max_position()
         size_pct = p.get("position_size_pct", 0.08)
+        if window_age is not None and window_age < 90:
+            size_pct *= 1.2  # Larger positions in early window
         amount = max_pos * size_pct * (0.5 + confidence)
         amount = min(amount, max_pos)
 

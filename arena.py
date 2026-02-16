@@ -7,7 +7,7 @@ import sys
 import time
 import random
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
@@ -37,7 +37,8 @@ logging.basicConfig(
 logger = logging.getLogger("arena")
 
 # Market check interval (seconds)
-TRADE_INTERVAL = 60    # Discover markets + place trades every 60s
+TRADE_INTERVAL = 15    # Discover markets + place trades every 15s (fast market discovery)
+RESOLVE_INTERVAL = 60  # Resolve trades + expire stale every 60s (expensive, no need to rush)
 FAST_POLL_INTERVAL = 0.5  # Poll market prices for SL/TP exits every 0.5s
 
 
@@ -660,6 +661,9 @@ def main_loop(bots, api_key):
         db.set_arena_state("evolution_cycle", "0")
         logger.info("No saved evolution state, starting fresh timer (persisted)")
 
+    # Throttle resolve/expire — only run every RESOLVE_INTERVAL
+    last_resolve_time = 0  # Run immediately on first iteration
+
     # Load recently traded (bot_name, market_id) pairs from DB to prevent
     # duplicate trades across restarts
     traded = set()
@@ -705,15 +709,16 @@ def main_loop(bots, api_key):
                 # Update position monitor with new bot roster
                 pos_monitor.update_bots(bots)
 
-            # Resolve completed trades (check all accounts)
-            if multi_account:
-                for slot_key in set(bot_keys.values()):
-                    resolve_trades(slot_key)
-            else:
-                resolve_trades(api_key)
-
-            # Clean up stale trades that fell off the resolved API
-            expire_stale_trades()
+            # Resolve completed trades + expire stale (throttled to every 60s)
+            now = time.time()
+            if now - last_resolve_time >= RESOLVE_INTERVAL:
+                if multi_account:
+                    for slot_key in set(bot_keys.values()):
+                        resolve_trades(slot_key)
+                else:
+                    resolve_trades(api_key)
+                expire_stale_trades()
+                last_resolve_time = now
 
             # Discover active markets (any key works for read-only)
             markets = discover_markets(api_key)
@@ -729,6 +734,43 @@ def main_loop(bots, api_key):
                 logger.debug(f"Found {len(markets)} BTC markets but none are strict 5-min windows, waiting...")
                 time.sleep(30)
                 continue
+
+            # Compute window age and filter out late-window markets
+            now_utc = datetime.now(timezone.utc)
+            tradeable_markets = []
+            for m in five_min_markets:
+                resolves_at_str = m.get("resolves_at") or m.get("end_time")
+                if resolves_at_str:
+                    try:
+                        # Parse ISO format: "2026-02-17 03:10:00Z" or "2026-02-17T03:10:00Z"
+                        rat = resolves_at_str.replace("Z", "+00:00").replace(" ", "T")
+                        resolves_at = datetime.fromisoformat(rat)
+                        time_remaining = (resolves_at - now_utc).total_seconds()
+                        window_age = 300 - time_remaining  # 5-min windows = 300s
+
+                        m["time_remaining_seconds"] = time_remaining
+                        m["window_age_seconds"] = window_age
+
+                        if time_remaining < 0:
+                            logger.debug(f"Skipping expired market (remaining={time_remaining:.0f}s): {m.get('question', '')[:50]}")
+                            continue
+                        if time_remaining < 90:
+                            logger.debug(f"Skipping late-window market (remaining={time_remaining:.0f}s): {m.get('question', '')[:50]}")
+                            continue
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Could not parse resolves_at '{resolves_at_str}': {e}")
+                        # Still tradeable, just without time context
+                        m["time_remaining_seconds"] = None
+                        m["window_age_seconds"] = None
+
+                tradeable_markets.append(m)
+
+            if not tradeable_markets:
+                logger.debug(f"All {len(five_min_markets)} 5-min markets filtered out (late-window), waiting...")
+                time.sleep(TRADE_INTERVAL)
+                continue
+
+            five_min_markets = tradeable_markets
 
             # Gather signals
             price_signals = price_feed.get_signals("btc")
