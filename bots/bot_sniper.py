@@ -1,12 +1,11 @@
 """Sniper bot — only trades when historical data shows 65%+ win rate.
 
-Data-driven rules from 850+ resolved trades:
-- YES at 40-50c: 69% WR, +$34 total (cheap shares, big profit on win)
-- YES at 60-80c: 60-87% WR, +$30 total (strong market signal)
-- NO at 20-35c: 90% WR, +$14 total (follow strong consensus)
-- SKIP 50-60c: 43% WR, -$45 total (coin flip, no edge)
-- SKIP 90c+: 44% WR, -$38 total (terrible risk/reward)
-- BTC momentum must confirm direction (BTC up → YES only)
+v2 adjustments from sniper-v1 trade data (13 trades):
+- cheap YES (40-48c): 100% WR, +$8.60 — KEEP, this is the money zone
+- strong YES (58-65c): 20% WR, -$10.03 — REMOVED, widened skip zone to 64c
+- strong YES (65-85c): 33% WR, -$6.49 — TIGHTENED, max YES now 78c
+- strong NO (0-35c): only <25c won — TIGHTENED, max NO now 25c
+- Momentum threshold tightened (0.0005 → 0.0003) to filter marginal trades
 
 Trades less often but with much higher accuracy.
 """
@@ -17,11 +16,12 @@ from bots.base_bot import BaseBot
 
 DEFAULT_PARAMS = {
     "min_price_yes": 0.40,     # Min YES price for YES bets
-    "max_price_yes": 0.85,     # Max YES price for YES bets (above = bad risk/reward)
-    "max_price_no": 0.35,      # Max YES price for NO bets (below 35c = bet NO)
-    "skip_zone_low": 0.48,     # Start of coin-flip dead zone
-    "skip_zone_high": 0.58,    # End of coin-flip dead zone
+    "max_price_yes": 0.78,     # Max YES price for YES bets (was 0.85 — 80c+ lost money)
+    "max_price_no": 0.25,      # Max YES price for NO bets (was 0.35 — 30-35c lost, only <25c won)
+    "skip_zone_low": 0.45,     # Start of coin-flip dead zone (was 0.48)
+    "skip_zone_high": 0.64,    # End of coin-flip dead zone (was 0.58 — 58-65c was 20% WR)
     "require_momentum": True,  # Only trade when BTC momentum confirms
+    "momentum_threshold": 0.0003,  # Tighter threshold (was 0.0005 hardcoded)
     "position_size_pct": 0.08, # Larger positions since we're more selective
     "min_confidence": 0.10,    # Only trade with real edge
 }
@@ -116,15 +116,16 @@ class SniperBot(BaseBot):
             }
 
         # --- Rule 3: BTC momentum must confirm ---
+        mom_thresh = p.get("momentum_threshold", 0.0003)
         if require_mom:
-            if side == "yes" and btc_momentum < -0.0005:
+            if side == "yes" and btc_momentum < -mom_thresh:
                 # BTC dropping, don't bet YES
                 return {
                     "action": "skip", "side": side, "confidence": confidence,
                     "reasoning": f"sniper: BTC momentum negative ({btc_momentum:+.4f}), skip YES",
                     "suggested_amount": 0, "features": features,
                 }
-            if side == "no" and btc_momentum > 0.0005:
+            if side == "no" and btc_momentum > mom_thresh:
                 # BTC rising, don't bet NO
                 return {
                     "action": "skip", "side": side, "confidence": confidence,
