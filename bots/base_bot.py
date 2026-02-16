@@ -52,15 +52,17 @@ class BaseBot(ABC):
         "sentiment": 1.0,       # neutral
         "hybrid": 1.0,          # neutral (was 0.9, contrarian loses)
     }
-    # Minimum confidence to place a trade (low = trades more, generates learning data)
+    # Minimum confidence to place a trade
+    # Data: conf <0.25 has ~46% WR and loses money (need >53% WR to break even)
+    # Only conf 0.30-0.50 is reliably profitable (65% WR, +$21)
     MIN_TRADE_CONFIDENCE = {
-        "momentum": 0.01,       # trades almost everything (aggressive learner)
-        "mean_reversion": 0.06, # slightly selective
-        "mean_reversion_sl": 0.06,
-        "mean_reversion_tp": 0.06,
-        "sniper": 0.10,         # highly selective — only trades high-WR zones
-        "sentiment": 0.03,      # moderate
-        "hybrid": 0.05,         # moderate-selective
+        "momentum": 0.25,       # was 0.01 — low conf trades lost $37
+        "mean_reversion": 0.25, # was 0.06
+        "mean_reversion_sl": 0.25,
+        "mean_reversion_tp": 0.25,
+        "sniper": 0.10,         # sniper has its own decision logic
+        "sentiment": 0.25,      # was 0.03
+        "hybrid": 0.25,         # was 0.05
     }
 
     def __init__(self, name, strategy_type, params, generation=0, lineage=None):
@@ -153,18 +155,34 @@ class BaseBot(ABC):
         side = "yes" if combined > 0 else "no"
         confidence = min(0.95, abs(combined) * 2)
 
-        # --- Market consensus guard ---
-        # Data shows: betting against strong market consensus is 0-10% WR.
-        # When market strongly favors one side, NEVER bet against it.
-        if market_price > 0.65 and side == "no":
+        # --- NO bet ban ---
+        # Data: NO bets lose at EVERY confidence level (44% WR, -$132 all-time).
+        # YES-only strategy is strictly better.
+        if side == "no":
             return {
                 "action": "skip",
                 "side": side,
                 "confidence": confidence,
-                "reasoning": f"Market consensus guard: price={market_price:.2f} too high to bet NO",
+                "reasoning": f"NO ban: NO bets 44% WR all-time | price={market_price:.2f}",
                 "suggested_amount": 0,
                 "features": features,
             }
+
+        # --- High-price YES guard ---
+        # Data: YES at >72c has bad risk/reward (pay 75c, profit 25c on win,
+        # lose 75c on loss). conf 0.50+ is 59% WR but net -$23 from this.
+        if market_price > 0.72:
+            return {
+                "action": "skip",
+                "side": side,
+                "confidence": confidence,
+                "reasoning": f"High-price guard: price={market_price:.2f} >72c, bad risk/reward for YES",
+                "suggested_amount": 0,
+                "features": features,
+            }
+
+        # --- Market consensus guard ---
+        # Data shows: betting against strong market consensus is 0-10% WR.
         if market_price < 0.35 and side == "yes":
             return {
                 "action": "skip",
