@@ -2,6 +2,7 @@
 
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -14,6 +15,43 @@ import db
 import learning
 
 app = FastAPI(title="Polymarket Bot Arena Dashboard")
+
+# Balance cache: slot_name -> {"balance": float, "fetched_at": float}
+_balance_cache = {}
+BALANCE_CACHE_TTL = 60  # seconds
+
+
+def _fetch_slot_balance(api_key):
+    """Fetch balance for a Simmer account."""
+    import requests
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        resp = requests.get(
+            f"{config.SIMMER_BASE_URL}/api/sdk/agents/me",
+            headers=headers, timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("balance")
+    except Exception:
+        pass
+    return None
+
+
+def get_bot_balance(slot_name, bot_keys):
+    """Get cached or fresh balance for a bot slot."""
+    now = time.time()
+    cached = _balance_cache.get(slot_name)
+    if cached and (now - cached["fetched_at"]) < BALANCE_CACHE_TTL:
+        return cached["balance"]
+
+    api_key = bot_keys.get(slot_name)
+    if not api_key:
+        return None
+
+    balance = _fetch_slot_balance(api_key)
+    _balance_cache[slot_name] = {"balance": balance, "fetched_at": now}
+    return balance
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -41,6 +79,16 @@ async def set_mode(request: Request):
         return JSONResponse({"error": "Mode must be 'paper' or 'live'"}, 400)
     config.set_trading_mode(mode)
     return {"mode": config.get_current_mode()}
+
+
+@app.post("/api/bots/{bot_name}/mode")
+async def set_bot_mode(bot_name: str, request: Request):
+    body = await request.json()
+    mode = body.get("mode")
+    if mode not in ("paper", "live"):
+        return JSONResponse({"error": "Mode must be 'paper' or 'live'"}, 400)
+    db.set_bot_mode(bot_name, mode)
+    return {"bot_name": bot_name, "trading_mode": mode}
 
 
 @app.get("/api/markets")
@@ -88,8 +136,17 @@ async def get_overview():
 @app.get("/api/bots")
 async def get_bots():
     active = db.get_active_bots()
+
+    # Load bot keys for balance fetching
+    bot_keys = {}
+    try:
+        with open(config.SIMMER_BOT_KEYS_PATH) as f:
+            bot_keys = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
     result = []
-    for bot_cfg in active:
+    for i, bot_cfg in enumerate(active):
         # Parse params JSON string if needed
         cfg = dict(bot_cfg)
         if isinstance(cfg.get("params"), str):
@@ -107,12 +164,22 @@ async def get_bots():
                 (cfg["bot_name"],)
             ).fetchone()
             pending_count = dict(row)["c"]
+
+        # Per-bot trading mode
+        trading_mode = db.get_bot_mode(cfg["bot_name"])
+
+        # Wallet balance from Simmer
+        slot_name = f"slot_{i}"
+        balance = get_bot_balance(slot_name, bot_keys)
+
         result.append({
             "config": cfg,
             "performance_12h": perf_12h,
             "performance_24h": perf_24h,
             "recent_trades": trades,
             "pending_trades": pending_count,
+            "trading_mode": trading_mode,
+            "balance": balance,
         })
     return JSONResponse(result)
 

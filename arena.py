@@ -151,10 +151,10 @@ def _validate_bot(bot):
 
 
 def run_evolution(bots, cycle_number):
-    """Run evolution cycle — kill bottom 3, mutate from winner."""
+    """Run evolution cycle — kill bots below WR threshold, mutate from survivors."""
     logger.info(f"=== Evolution Cycle {cycle_number} ===")
 
-    # Rank bots by P&L over the evolution window
+    # Gather performance and classify by WR
     rankings = []
     for bot in bots:
         perf = bot.get_performance(hours=config.EVOLUTION_INTERVAL_HOURS)
@@ -167,14 +167,46 @@ def run_evolution(bots, cycle_number):
             "trades": perf["total_trades"],
         })
 
-    rankings.sort(key=lambda x: x["pnl"], reverse=True)
-    logger.info("Rankings:")
-    for i, r in enumerate(rankings):
-        status = "SURVIVES" if i < config.SURVIVORS_PER_CYCLE else "REPLACED"
-        logger.info(f"  #{i+1} {r['name']}: P&L=${r['pnl']:.2f}, WR={r['win_rate']:.1%}, Trades={r['trades']} [{status}]")
+    # Sort by WR (not P&L) for ranking display
+    rankings.sort(key=lambda x: x["win_rate"], reverse=True)
 
-    survivor_names = {rankings[i]["name"] for i in range(config.SURVIVORS_PER_CYCLE)}
-    replaced_names = {rankings[i]["name"] for i in range(config.SURVIVORS_PER_CYCLE, len(rankings))}
+    # Classify bots
+    immune = []       # <MIN_TRADES resolved trades — not enough data
+    above = []        # WR >= MIN_WIN_RATE with enough trades — survive
+    below = []        # WR < MIN_WIN_RATE with enough trades — get replaced
+    for r in rankings:
+        if r["trades"] < config.MIN_TRADES_FOR_JUDGMENT:
+            immune.append(r)
+        elif r["win_rate"] >= config.MIN_WIN_RATE:
+            above.append(r)
+        else:
+            below.append(r)
+
+    logger.info("Rankings (WR-based):")
+    for r in rankings:
+        if r in immune:
+            status = "IMMUNE"
+        elif r in above:
+            status = "SURVIVES"
+        else:
+            status = "REPLACED"
+        logger.info(f"  {r['name']}: WR={r['win_rate']:.1%}, P&L=${r['pnl']:.2f}, Trades={r['trades']} [{status}]")
+
+    # Safety net: if ALL would be killed (no immune + no above), keep best 1 by WR
+    if not immune and not above and below:
+        best = below.pop(0)  # rankings already sorted by WR desc, so first in below is best
+        above.append(best)
+        logger.info(f"  Safety net: keeping {best['name']} (best WR {best['win_rate']:.1%}) as sole survivor")
+
+    # If nobody needs replacing, early return
+    if not below:
+        logger.info("  No bots below threshold — skipping evolution")
+        for bot in bots:
+            bot.reset_daily()
+        return bots
+
+    survivor_names = {r["name"] for r in immune + above}
+    replaced_names = {r["name"] for r in below}
 
     new_bots = []
     for bot in bots:
@@ -854,6 +886,10 @@ def main():
     for bot in bots:
         if bot.name not in existing:
             db.save_bot_config(bot.name, bot.strategy_type, bot.generation, bot.strategy_params)
+
+    # Load per-bot trading modes from DB
+    for bot in bots:
+        bot.trading_mode = db.get_bot_mode(bot.name)
 
     # Backfill learning data from old resolved trades that had no trade_features
     backfilled = learning.backfill_from_resolved_trades()

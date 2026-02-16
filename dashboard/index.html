@@ -46,6 +46,11 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .btn-danger { background: #da3633; color: #fff; }
 .btn-cancel { background: #30363d; color: #c9d1d9; }
 .refresh-info { color: #484f58; font-size: 11px; text-align: right; margin-top: 8px; }
+.bot-mode-btn { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; cursor: pointer; border: none; font-family: inherit; }
+.bot-mode-paper { background: #238636; color: #fff; }
+.bot-mode-live { background: #da3633; color: #fff; }
+.bot-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+.bot-balance { color: #8b949e; font-size: 12px; }
 .market-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #21262d; }
 .market-row:last-child { border-bottom: none; }
 .market-question { color: #c9d1d9; font-size: 13px; flex: 1; }
@@ -131,13 +136,23 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
     <div class="refresh-info">Auto-refreshes every 10 seconds</div>
 </div>
 
-<!-- Confirm Modal -->
+<!-- Confirm Modal (global mode) -->
 <div class="confirm-modal" id="confirm-modal">
     <div class="confirm-box">
         <h3>Switch to LIVE Trading?</h3>
         <p>This will trade with real USDC on Polymarket. Make sure you understand the risks.</p>
         <button class="btn btn-danger" onclick="confirmLive()">YES — Go Live</button>
         <button class="btn btn-cancel" onclick="cancelModal()">Cancel</button>
+    </div>
+</div>
+
+<!-- Confirm Modal (per-bot mode) -->
+<div class="confirm-modal" id="bot-confirm-modal">
+    <div class="confirm-box">
+        <h3>Switch <span id="bot-confirm-name"></span> to LIVE?</h3>
+        <p>This bot will start trading with real USDC on Polymarket. Other bots remain unchanged.</p>
+        <button class="btn btn-danger" onclick="confirmBotLive()">YES — Go Live</button>
+        <button class="btn btn-cancel" onclick="cancelBotModal()">Cancel</button>
     </div>
 </div>
 
@@ -185,13 +200,20 @@ function updateBots(bots) {
         const p12 = bot.performance_12h || {};
         const trades = bot.recent_trades || [];
         const params = typeof cfg.params === 'string' ? JSON.parse(cfg.params) : cfg.params;
+        const botMode = bot.trading_mode || 'paper';
+        const balance = bot.balance;
+        const balanceStr = balance != null ? '$' + Number(balance).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' SIM' : 'N/A';
 
         const pending = bot.pending_trades || 0;
         const card = document.createElement('div');
         card.className = 'card bot-card' + (i < 2 ? ' top' : '');
         card.innerHTML = `
-            <div class="bot-name">${cfg.bot_name}</div>
+            <div class="bot-header">
+                <div class="bot-name">${cfg.bot_name}</div>
+                <button class="bot-mode-btn bot-mode-${botMode}" onclick="toggleBotMode('${cfg.bot_name}', '${botMode}')">${botMode.toUpperCase()}</button>
+            </div>
             <div class="bot-meta">${cfg.strategy_type} | Gen ${cfg.generation} | ${cfg.lineage || '-'}</div>
+            <div class="stat-row"><span class="stat-label">Balance</span><span class="stat-value bot-balance">${balanceStr}</span></div>
             <div class="stat-row"><span class="stat-label">12h P&L</span><span class="stat-value ${pnlClass(p12.total_pnl)}">${fmtPnl(p12.total_pnl || 0)}</span></div>
             <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value">${winRate(p12.wins, p12.losses)}</span></div>
             <div class="stat-row"><span class="stat-label">Trades (12h)</span><span class="stat-value">${p12.total_trades || 0}${pending ? ' <span style="color:#f0883e">+' + pending + ' pending</span>' : ''}</span></div>
@@ -385,6 +407,35 @@ function confirmLive() {
 
 function cancelModal() {
     document.getElementById('confirm-modal').classList.remove('active');
+}
+
+let pendingBotToggle = null;
+
+function toggleBotMode(botName, currentMode) {
+    if (currentMode === 'paper') {
+        pendingBotToggle = botName;
+        document.getElementById('bot-confirm-name').textContent = botName;
+        document.getElementById('bot-confirm-modal').classList.add('active');
+    } else {
+        fetch(`/api/bots/${botName}/mode`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({mode: 'paper'})
+        }).then(() => refresh());
+    }
+}
+
+function confirmBotLive() {
+    if (pendingBotToggle) {
+        fetch(`/api/bots/${pendingBotToggle}/mode`, {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({mode: 'live'})
+        }).then(() => { cancelBotModal(); refresh(); });
+    }
+}
+
+function cancelBotModal() {
+    pendingBotToggle = null;
+    document.getElementById('bot-confirm-modal').classList.remove('active');
 }
 
 async function refresh() {

@@ -106,6 +106,12 @@ def init_db():
             );
         """)
 
+        # Migration: add trading_mode column to bot_configs
+        try:
+            conn.execute("ALTER TABLE bot_configs ADD COLUMN trading_mode TEXT DEFAULT 'paper'")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
 
 @contextmanager
 def get_conn():
@@ -319,6 +325,29 @@ def set_arena_state(key, value):
             """INSERT INTO arena_state (key, value) VALUES (?, ?)
                ON CONFLICT(key) DO UPDATE SET value=?, updated_at=datetime('now')""",
             (key, str(value), str(value))
+        )
+
+
+def get_bot_mode(bot_name):
+    """Get per-bot trading mode ('paper' or 'live')."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT trading_mode FROM bot_configs WHERE bot_name=? AND active=1",
+            (bot_name,)
+        ).fetchone()
+        if row:
+            return row["trading_mode"] or "paper"
+        return "paper"
+
+
+def set_bot_mode(bot_name, mode):
+    """Set per-bot trading mode ('paper' or 'live')."""
+    if mode not in ("paper", "live"):
+        raise ValueError("Mode must be 'paper' or 'live'")
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE bot_configs SET trading_mode=? WHERE bot_name=? AND active=1",
+            (mode, bot_name)
         )
 
 

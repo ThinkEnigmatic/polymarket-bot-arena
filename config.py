@@ -49,6 +49,8 @@ EVOLUTION_INTERVAL_HOURS = 2
 MUTATION_RATE = 0.15  # 15% random adjustment to params
 NUM_BOTS = 4
 SURVIVORS_PER_CYCLE = 1  # Top 1 survives, bottom 3 replaced
+MIN_TRADES_FOR_JUDGMENT = 20   # Bots with fewer resolved trades are immune
+MIN_WIN_RATE = 0.70            # 70% WR threshold to survive evolution
 
 # Signal Feed Settings
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"

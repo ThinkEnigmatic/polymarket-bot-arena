@@ -70,6 +70,7 @@ class BaseBot(ABC):
         self.generation = generation
         self.lineage = lineage or name
         self._paused = False
+        self.trading_mode = "paper"
 
     @abstractmethod
     def analyze(self, market: dict, signals: dict) -> dict:
@@ -221,8 +222,10 @@ class BaseBot(ABC):
             logger.info(f"[{self.name}] Paused, skipping trade")
             return {"success": False, "reason": "bot_paused"}
 
-        mode = config.get_current_mode()
-        venue = config.get_venue()
+        # Per-bot mode: fresh read from DB so dashboard toggles take effect immediately
+        self.trading_mode = db.get_bot_mode(self.name)
+        mode = self.trading_mode
+        venue = "polymarket" if mode == "live" else "simmer"
         max_pos = config.get_max_position()
 
         # Check risk limits
