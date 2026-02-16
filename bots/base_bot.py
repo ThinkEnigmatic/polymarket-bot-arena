@@ -38,6 +38,7 @@ class BaseBot(ABC):
         "mean_reversion": 0.48, # slight NO bias — mean reversion bets against crowd
         "mean_reversion_sl": 0.48,
         "mean_reversion_tp": 0.48,
+        "sniper": 0.50,         # neutral — sniper uses its own rules
         "sentiment": 0.50,      # neutral
         "hybrid": 0.50,         # neutral
     }
@@ -47,6 +48,7 @@ class BaseBot(ABC):
         "mean_reversion": 0.95, # nearly follows market (contrarian was -$16 loser)
         "mean_reversion_sl": 0.95,
         "mean_reversion_tp": 0.95,
+        "sniper": 1.0,          # sniper overrides make_decision entirely
         "sentiment": 1.0,       # neutral
         "hybrid": 1.0,          # neutral (was 0.9, contrarian loses)
     }
@@ -56,6 +58,7 @@ class BaseBot(ABC):
         "mean_reversion": 0.06, # slightly selective
         "mean_reversion_sl": 0.06,
         "mean_reversion_tp": 0.06,
+        "sniper": 0.10,         # highly selective — only trades high-WR zones
         "sentiment": 0.03,      # moderate
         "hybrid": 0.05,         # moderate-selective
     }

@@ -19,6 +19,7 @@ from bots.bot_sentiment import SentimentBot
 from bots.bot_hybrid import HybridBot
 from bots.bot_meanrev_sl import MeanRevSLBot
 from bots.bot_meanrev_tp import MeanRevTPBot
+from bots.bot_sniper import SniperBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
 from signals.orderflow import get_feed as get_orderflow_feed
@@ -49,6 +50,7 @@ def create_default_bots():
             "mean_reversion": MeanRevBot,
             "mean_reversion_sl": MeanRevSLBot,
             "mean_reversion_tp": MeanRevTPBot,
+            "sniper": SniperBot,
             "sentiment": SentimentBot,
             "hybrid": HybridBot,
         }
@@ -90,11 +92,14 @@ def create_evolved_bot(winner, loser_type, gen_number):
     from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
     from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
 
+    from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
+
     bot_classes = {
         "momentum": MomentumBot,
         "mean_reversion": MeanRevBot,
         "mean_reversion_sl": MeanRevSLBot,
         "mean_reversion_tp": MeanRevTPBot,
+        "sniper": SniperBot,
         "sentiment": SentimentBot,
         "hybrid": HybridBot,
     }
@@ -104,6 +109,7 @@ def create_evolved_bot(winner, loser_type, gen_number):
         "mean_reversion": MEANREV_DEFAULTS,
         "mean_reversion_sl": MEANREV_DEFAULTS,
         "mean_reversion_tp": MEANREV_DEFAULTS,
+        "sniper": SNIPER_DEFAULTS,
         "sentiment": SENTIMENT_DEFAULTS,
         "hybrid": HYBRID_DEFAULTS,
     }
@@ -195,14 +201,17 @@ def run_evolution(bots, cycle_number):
             from bots.bot_mean_rev import DEFAULT_PARAMS as MEANREV_DEFAULTS
             from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
             from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
+            from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
             fallback_map = {
                 "momentum": MOMENTUM_DEFAULTS, "mean_reversion": MEANREV_DEFAULTS,
                 "mean_reversion_sl": MEANREV_DEFAULTS, "mean_reversion_tp": MEANREV_DEFAULTS,
+                "sniper": SNIPER_DEFAULTS,
                 "sentiment": SENTIMENT_DEFAULTS, "hybrid": HYBRID_DEFAULTS,
             }
             bot_classes = {
                 "momentum": MomentumBot, "mean_reversion": MeanRevBot,
                 "mean_reversion_sl": MeanRevSLBot, "mean_reversion_tp": MeanRevTPBot,
+                "sniper": SniperBot,
                 "sentiment": SentimentBot, "hybrid": HybridBot,
             }
             cls = bot_classes.get(dead_bot.strategy_type, MomentumBot)
