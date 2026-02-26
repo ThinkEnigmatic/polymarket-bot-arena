@@ -105,6 +105,10 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
     <div class="section-title">Active Bots</div>
     <div class="grid" id="bots-grid"></div>
 
+    <!-- Copy Bots -->
+    <div class="section-title" id="copy-section" style="display:none">Copy Bots</div>
+    <div class="grid" id="copy-grid"></div>
+
     <!-- Evolution History -->
     <div class="section-title">Evolution History</div>
     <div class="card" id="evolution-card">
@@ -160,7 +164,7 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 let currentMode = 'paper';
 
 async function fetchJSON(url) {
-    const resp = await fetch(url);
+    const resp = await fetch(url, { credentials: 'include' });
     return resp.json();
 }
 
@@ -201,8 +205,13 @@ function updateBots(bots) {
         const trades = bot.recent_trades || [];
         const params = typeof cfg.params === 'string' ? JSON.parse(cfg.params) : cfg.params;
         const botMode = bot.trading_mode || 'paper';
+        const isLive = botMode === 'live';
         const balance = bot.balance;
-        const balanceStr = balance != null ? '$' + Number(balance).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' SIM' : 'N/A';
+        const balanceSuffix = bot.balance_is_live ? ' USDC' : ' SIM';
+        const balanceStr = balance != null
+            ? '$' + Number(balance).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + balanceSuffix
+            : 'N/A';
+        const statsLabel = isLive ? 'Live' : '12h';
 
         const pending = bot.pending_trades || 0;
         const card = document.createElement('div');
@@ -214,9 +223,9 @@ function updateBots(bots) {
             </div>
             <div class="bot-meta">${cfg.strategy_type} | Gen ${cfg.generation} | ${cfg.lineage || '-'}</div>
             <div class="stat-row"><span class="stat-label">Balance</span><span class="stat-value bot-balance">${balanceStr}</span></div>
-            <div class="stat-row"><span class="stat-label">12h P&L</span><span class="stat-value ${pnlClass(p12.total_pnl)}">${fmtPnl(p12.total_pnl || 0)}</span></div>
+            <div class="stat-row"><span class="stat-label">${statsLabel} P&L</span><span class="stat-value ${pnlClass(p12.total_pnl)}">${fmtPnl(p12.total_pnl || 0)}</span></div>
             <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value">${winRate(p12.wins, p12.losses)}</span></div>
-            <div class="stat-row"><span class="stat-label">Trades (12h)</span><span class="stat-value">${p12.total_trades || 0}${pending ? ' <span style="color:#f0883e">+' + pending + ' pending</span>' : ''}</span></div>
+            <div class="stat-row"><span class="stat-label">Trades (${statsLabel})</span><span class="stat-value">${p12.total_trades || 0}${pending ? ' <span style="color:#f0883e">+' + pending + ' pending</span>' : ''}</span></div>
             <div class="trade-list">${trades.slice(0, 5).map(t => `
                 <div class="trade-item">
                     <span>${t.side} ${(t.market_question || '').slice(0, 30)}</span>
@@ -395,13 +404,13 @@ function toggleMode() {
     if (currentMode === 'paper') {
         document.getElementById('confirm-modal').classList.add('active');
     } else {
-        fetch('/api/mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'paper'}) })
+        fetch('/api/mode', { method: 'POST', credentials: 'include', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'paper'}) })
             .then(r => r.json()).then(d => updateMode(d.mode));
     }
 }
 
 function confirmLive() {
-    fetch('/api/mode', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'live'}) })
+    fetch('/api/mode', { method: 'POST', credentials: 'include', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: 'live'}) })
         .then(r => r.json()).then(d => { updateMode(d.mode); cancelModal(); });
 }
 
@@ -418,7 +427,7 @@ function toggleBotMode(botName, currentMode) {
         document.getElementById('bot-confirm-modal').classList.add('active');
     } else {
         fetch(`/api/bots/${botName}/mode`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
+            method: 'POST', credentials: 'include', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({mode: 'paper'})
         }).then(() => refresh());
     }
@@ -427,7 +436,7 @@ function toggleBotMode(botName, currentMode) {
 function confirmBotLive() {
     if (pendingBotToggle) {
         fetch(`/api/bots/${pendingBotToggle}/mode`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
+            method: 'POST', credentials: 'include', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({mode: 'live'})
         }).then(() => { cancelBotModal(); refresh(); });
     }
@@ -438,19 +447,54 @@ function cancelBotModal() {
     document.getElementById('bot-confirm-modal').classList.remove('active');
 }
 
+function updateCopyBots(wallets) {
+    const section = document.getElementById('copy-section');
+    const grid = document.getElementById('copy-grid');
+    if (!wallets || wallets.length === 0) { section.style.display = 'none'; grid.innerHTML = ''; return; }
+    section.style.display = '';
+    grid.innerHTML = wallets.map(w => {
+        const wr = w.win_rate != null ? (w.win_rate * 100).toFixed(1) + '%' : '-';
+        const pnlCls = (w.pnl || 0) >= 0 ? 'positive' : 'negative';
+        const modeBadge = w.mode === 'live'
+            ? '<span class="bot-mode-btn" style="background:#da3633;color:#fff">LIVE</span>'
+            : '<span class="bot-mode-btn" style="background:#238636;color:#fff">PAPER</span>';
+        const recentRows = (w.recent_trades || []).map(t => {
+            const oc = t.outcome === 'win' ? 'positive' : t.outcome === 'loss' ? 'negative' : 'neutral';
+            return `<div class="trade-item">
+                <span class="${t.side === 'yes' ? 'positive' : 'negative'}">${(t.side||'').toUpperCase()}</span>
+                <span class="neutral" style="flex:1;padding:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(t.market_question||'').substring(0,40)}</span>
+                <span class="${oc}">${t.outcome ? (t.pnl >= 0 ? '+' : '') + '$' + (t.pnl||0).toFixed(2) : 'pending'}</span>
+            </div>`;
+        }).join('');
+        return `<div class="card bot-card" style="border-left-color:#a371f7">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                <div class="bot-name" style="color:#a371f7">copy-${w.label}</div>
+                ${modeBadge}
+            </div>
+            <div class="bot-meta">following <a href="https://polymarket.com/@${w.wallet}" target="_blank" style="color:#58a6ff">${w.wallet.substring(0,16)}...</a></div>
+            <div class="stat-row"><span class="stat-label">P&amp;L</span><span class="stat-value ${pnlCls}">${(w.pnl||0) >= 0 ? '+' : ''}$${(w.pnl||0).toFixed(2)}</span></div>
+            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value">${wr}</span></div>
+            <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value">${w.total_trades || 0} (${w.resolved_trades || 0} resolved)</span></div>
+            <div class="trade-list" style="margin-top:8px">${recentRows || '<div class="neutral" style="font-size:12px;padding:4px 0">No trades yet — waiting for next signal</div>'}</div>
+        </div>`;
+    }).join('');
+}
+
 async function refresh() {
     try {
-        const [status, overview, bots, evolution, trades, earnings] = await Promise.all([
+        const [status, overview, bots, evolution, trades, earnings, copyBots] = await Promise.all([
             fetchJSON('/api/status'),
             fetchJSON('/api/overview'),
             fetchJSON('/api/bots'),
             fetchJSON('/api/evolution'),
             fetchJSON('/api/trades?limit=20'),
             fetchJSON('/api/earnings'),
+            fetchJSON('/api/copytrading'),
         ]);
         updateMode(status.mode);
         updateOverview(overview.stats);
-        updateBots(bots);
+        updateBots(bots.filter(b => b.config.strategy_type !== 'copy_trade'));
+        updateCopyBots(copyBots);
         updateEvolution(evolution);
         updateTrades(trades);
         updateEarnings(earnings);

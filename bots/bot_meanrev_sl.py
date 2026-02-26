@@ -24,37 +24,17 @@ class MeanRevSLBot(MeanRevBot):
         self.strategy_type = "mean_reversion_sl"
 
     def make_decision(self, market, signals):
-        """SL bot: more aggressive entries since downside is capped at 25%.
+        """SL bot: scale up position size since downside is capped at 25%.
 
-        With a 25% stop-loss, max loss per trade is only 25% of the position
-        instead of 100%. This changes the risk/reward math:
-        - A trade with 40% win probability at even odds is -EV normally
-        - But with SL capping losses at 25%, it becomes +EV
-        So we trade more aggressively and size up.
+        Respects all base class guards (hours filter, NO ban, confidence,
+        high-price guard). Only scales up bet size on trades the base logic approves.
         """
         decision = super().make_decision(market, signals)
 
         if decision.get("action") == "buy":
             # Scale up position size — max loss is 25% of position, not 100%
-            # So a $6 trade can only lose $1.50 (same risk as normal $1.50 trade)
             amount = decision.get("suggested_amount", 0) * 1.5
             decision["suggested_amount"] = min(amount, config.get_max_position())
             decision["reasoning"] += " [SL: 1.5x size, loss capped 25%]"
-            return decision
-
-        if decision.get("action") == "skip":
-            conf = decision.get("confidence", 0)
-            # Take marginal trades that base bot would skip —
-            # at 25% SL the risk is bounded so small edges are worth taking
-            if conf >= 0.03:
-                market_price = market.get("current_price", 0.5)
-                side = decision.get("side", "yes")
-                # Still respect market consensus guard
-                if (market_price > 0.65 and side == "no") or (market_price < 0.35 and side == "yes"):
-                    return decision
-                max_pos = config.get_max_position()
-                decision["action"] = "buy"
-                decision["suggested_amount"] = max_pos * 0.05  # small size for marginal trades
-                decision["reasoning"] += " [SL override: marginal edge, loss capped]"
 
         return decision

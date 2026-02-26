@@ -50,7 +50,7 @@ MUTATION_RATE = 0.15  # 15% random adjustment to params
 NUM_BOTS = 4
 SURVIVORS_PER_CYCLE = 1  # Top 1 survives, bottom 3 replaced
 MIN_TRADES_FOR_JUDGMENT = 20   # Bots with fewer resolved trades are immune
-MIN_WIN_RATE = 0.70            # 70% WR threshold to survive evolution
+MIN_WIN_RATE = 0.65            # 65% WR threshold to survive evolution
 
 # Signal Feed Settings
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
@@ -60,6 +60,12 @@ PRICE_UPDATE_INTERVAL_SEC = 1  # Real-time price updates
 COPYTRADING_ENABLED = True
 COPYTRADING_MAX_WALLETS_TO_TRACK = 10
 COPYTRADING_POSITION_SIZE_FRACTION = 0.5  # Copy 50% of whale's position size
+COPYTRADING_DAILY_SPEND_LIMIT = 50.0    # Max USDC to spend copying per calendar day
+COPYTRADING_MAX_TRADES_PER_CYCLE = 5    # Max trades to execute per arena loop cycle
+COPYTRADING_MIN_PRICE = 0.40            # Skip trades where whale's entry price < this
+COPYTRADING_MAX_PRICE = 0.65            # Skip trades where whale's entry price > this (expensive bets need 65%+ WR to break even)
+COPYTRADING_COPY_NO_BETS = False        # Copy NO bets — data shows NO side loses money, skip by default
+COPYTRADING_BLOCKED_HOURS_UTC = [22]    # UTC hours to skip entirely (22:00 = -$76 in data)
 
 # Dashboard Settings
 DASHBOARD_PORT = 8501

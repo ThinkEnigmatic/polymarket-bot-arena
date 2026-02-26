@@ -9,7 +9,7 @@ from collections import deque
 logger = logging.getLogger(__name__)
 
 BINANCE_WS = "wss://stream.binance.com:9443/ws"
-SYMBOLS = {"btc": "btcusdt"}
+SYMBOLS = {"btc": "btcusdt", "sol": "solusdt"}
 
 
 class PriceFeed:
