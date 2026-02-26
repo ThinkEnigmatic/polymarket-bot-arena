@@ -38,14 +38,29 @@ HOUR_BUCKETS = [
     ("hour_night", 22, 6),       # 10pm-6am ET (wraps)
 ]
 
+# New: Market context buckets
+VOLUME_BUCKETS = [
+    ("vol_low", 0, 500),
+    ("vol_mid", 500, 2500),
+    ("vol_high", 2500, 9999999),
+]
 
-def extract_features(market_price, price_momentum, hour_et=None):
+TIME_BUCKETS = [
+    ("time_early", 240, 9999),   # >4 min remaining
+    ("time_mid", 120, 240),      # 2-4 min remaining
+    ("time_late", 0, 120),       # <2 min remaining
+]
+
+
+def extract_features(market_price, price_momentum, hour_et=None, volume=None, time_rem=None):
     """Extract feature keys from market conditions.
 
     Args:
         market_price: current YES price (0.0-1.0)
         price_momentum: recent BTC price change as fraction (e.g. 0.002 = +0.2%)
         hour_et: hour of day in ET (0-23), auto-detected if None
+        volume: 24h volume of the market
+        time_rem: seconds remaining until resolution
 
     Returns:
         list of feature key strings
@@ -74,6 +89,20 @@ def extract_features(market_price, price_momentum, hour_et=None):
                 break
         else:  # wraps midnight
             if hour_et >= start or hour_et < end:
+                features.append(name)
+                break
+
+    # Volume bucket
+    if volume is not None:
+        for name, lo, hi in VOLUME_BUCKETS:
+            if lo <= volume < hi:
+                features.append(name)
+                break
+
+    # Time bucket
+    if time_rem is not None:
+        for name, lo, hi in TIME_BUCKETS:
+            if lo <= time_rem < hi:
                 features.append(name)
                 break
 
@@ -206,21 +235,35 @@ def extract_features_from_reasoning(reasoning):
     return None
 
 
-def backfill_from_resolved_trades():
+def backfill_from_resolved_trades(bot_names=None):
     """Backfill bot_learning from resolved trades that have no trade_features.
 
     Parses market price from reasoning text to reconstruct features.
     Only processes trades with outcome='win' or 'loss'.
+    If bot_names is provided, only backfill for those bots.
     Returns the number of trades backfilled.
     """
     with db.get_conn() as conn:
-        rows = conn.execute("""
-            SELECT id, bot_name, side, outcome, reasoning, created_at
-            FROM trades
-            WHERE outcome IN ('win', 'loss')
-              AND trade_features IS NULL
-              AND reasoning IS NOT NULL
-        """).fetchall()
+        if bot_names is not None:
+            if not bot_names:
+                return 0  # Empty list = nothing to backfill
+            placeholders = ",".join("?" for _ in bot_names)
+            rows = conn.execute(f"""
+                SELECT id, bot_name, side, outcome, reasoning, created_at
+                FROM trades
+                WHERE outcome IN ('win', 'loss')
+                  AND trade_features IS NULL
+                  AND reasoning IS NOT NULL
+                  AND bot_name IN ({placeholders})
+            """, bot_names).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT id, bot_name, side, outcome, reasoning, created_at
+                FROM trades
+                WHERE outcome IN ('win', 'loss')
+                  AND trade_features IS NULL
+                  AND reasoning IS NOT NULL
+            """).fetchall()
 
     count = 0
     for r in rows:

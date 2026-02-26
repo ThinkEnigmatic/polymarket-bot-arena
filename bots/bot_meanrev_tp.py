@@ -27,35 +27,14 @@ class MeanRevTPBot(MeanRevBot):
         self.strategy_type = "mean_reversion_tp"
 
     def make_decision(self, market, signals):
-        """TP bot: always enter, let the 2x exit do the work.
+        """TP bot: enter when base logic says buy, monitor for 2x exit.
 
-        Never skips a market — every position is an opportunity for the
-        0.5s monitor to catch a 2x spike. If 2x never happens, the
-        trade resolves at the end of the 5-min window like normal.
+        Respects all base class guards (hours filter, NO ban, confidence,
+        high-price guard). Only adds TP monitoring annotation.
         """
         decision = super().make_decision(market, signals)
 
         if decision.get("action") == "buy":
             decision["reasoning"] += " [TP: monitoring for 2x exit @0.5s]"
-            return decision
-
-        # Override skips — this bot always enters a position
-        if decision.get("action") == "skip":
-            market_price = market.get("current_price", 0.5)
-            side = decision.get("side", "yes")
-            conf = decision.get("confidence", 0)
-
-            # Still respect market consensus guard (betting against >65c or <35c is suicidal)
-            if (market_price > 0.65 and side == "no") or (market_price < 0.35 and side == "yes"):
-                return decision
-
-            max_pos = config.get_max_position()
-            # Size based on whatever confidence exists, min $1.50
-            amount = max(max_pos * 0.03, max_pos * conf * 0.10)
-            amount = min(amount, max_pos)
-
-            decision["action"] = "buy"
-            decision["suggested_amount"] = amount
-            decision["reasoning"] += " [TP override: always enter, monitoring 2x @0.5s]"
 
         return decision

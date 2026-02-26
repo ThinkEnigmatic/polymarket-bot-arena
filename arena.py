@@ -20,6 +20,11 @@ from bots.bot_hybrid import HybridBot
 from bots.bot_meanrev_sl import MeanRevSLBot
 from bots.bot_meanrev_tp import MeanRevTPBot
 from bots.bot_sniper import SniperBot
+from bots.bot_phantom import PhantomBot
+from bots.bot_btc_maker import BtcMakerBot
+from bots.bot_late_window_maker import LateWindowMakerBot
+from bots.bot_fee_zone_maker import FeeZoneMakerBot
+from bots.bot_copy import CopyBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
 from signals.orderflow import get_feed as get_orderflow_feed
@@ -35,6 +40,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("arena")
+maker_logger = logging.getLogger("arena.maker")
 
 # Market check interval (seconds)
 TRADE_INTERVAL = 15    # Discover markets + place trades every 15s (fast market discovery)
@@ -52,11 +58,16 @@ def create_default_bots():
             "mean_reversion_sl": MeanRevSLBot,
             "mean_reversion_tp": MeanRevTPBot,
             "sniper": SniperBot,
+            "phantom": PhantomBot,
             "sentiment": SentimentBot,
             "hybrid": HybridBot,
         }
+        # Maker and copy bots are managed separately — exclude from taker list.
+        MAKER_TYPES = {"late_window_maker", "fee_zone_maker", "btc_maker", "copy_trade"}
         bots = []
         for cfg in active:
+            if cfg["strategy_type"] in MAKER_TYPES:
+                continue
             cls = bot_classes.get(cfg["strategy_type"], MomentumBot)
             params = cfg["params"]
             if isinstance(params, str):
@@ -76,7 +87,7 @@ def create_default_bots():
         MomentumBot(name="momentum-v1", generation=0),
         HybridBot(name="hybrid-v1", generation=0),
         MeanRevSLBot(name="meanrev-sl25-v1", generation=0),
-        MeanRevTPBot(name="meanrev-tp2x-v1", generation=0),
+        PhantomBot(name="phantom-v1", generation=0),
     ]
 
 
@@ -94,6 +105,7 @@ def create_evolved_bot(winner, loser_type, gen_number):
     from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
 
     from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
+    from bots.bot_phantom import DEFAULT_PARAMS as PHANTOM_DEFAULTS
 
     bot_classes = {
         "momentum": MomentumBot,
@@ -101,6 +113,7 @@ def create_evolved_bot(winner, loser_type, gen_number):
         "mean_reversion_sl": MeanRevSLBot,
         "mean_reversion_tp": MeanRevTPBot,
         "sniper": SniperBot,
+        "phantom": PhantomBot,
         "sentiment": SentimentBot,
         "hybrid": HybridBot,
     }
@@ -111,6 +124,7 @@ def create_evolved_bot(winner, loser_type, gen_number):
         "mean_reversion_sl": MEANREV_DEFAULTS,
         "mean_reversion_tp": MEANREV_DEFAULTS,
         "sniper": SNIPER_DEFAULTS,
+        "phantom": PHANTOM_DEFAULTS,
         "sentiment": SENTIMENT_DEFAULTS,
         "hybrid": HYBRID_DEFAULTS,
     }
@@ -235,16 +249,17 @@ def run_evolution(bots, cycle_number):
             from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
             from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
             from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
+            from bots.bot_phantom import DEFAULT_PARAMS as PHANTOM_DEFAULTS
             fallback_map = {
                 "momentum": MOMENTUM_DEFAULTS, "mean_reversion": MEANREV_DEFAULTS,
                 "mean_reversion_sl": MEANREV_DEFAULTS, "mean_reversion_tp": MEANREV_DEFAULTS,
-                "sniper": SNIPER_DEFAULTS,
+                "sniper": SNIPER_DEFAULTS, "phantom": PHANTOM_DEFAULTS,
                 "sentiment": SENTIMENT_DEFAULTS, "hybrid": HYBRID_DEFAULTS,
             }
             bot_classes = {
                 "momentum": MomentumBot, "mean_reversion": MeanRevBot,
                 "mean_reversion_sl": MeanRevSLBot, "mean_reversion_tp": MeanRevTPBot,
-                "sniper": SniperBot,
+                "sniper": SniperBot, "phantom": PhantomBot,
                 "sentiment": SentimentBot, "hybrid": HybridBot,
             }
             cls = bot_classes.get(dead_bot.strategy_type, MomentumBot)
@@ -350,6 +365,137 @@ def expire_stale_trades():
     if count > 0:
         logger.info(f"Expired {count} stale trades (>1h old, never resolved)")
     return count
+
+
+def run_maker_section(maker_bot, market, signals, traded):
+    """Run one BtcMakerBot paper-trading cycle on a single market.
+
+    Always paper-only: the bot's trading_mode is forced to 'paper' before every
+    call so that even if the DB row were toggled to 'live' by mistake, no real
+    Polymarket orders are ever placed from here.
+
+    Logs maker metrics (edge, bid, ask) on every cycle regardless of whether a
+    trade is placed.
+
+    Returns True if a paper trade was recorded, False otherwise.
+    """
+    # --- Safety: enforce paper mode unconditionally ---
+    maker_bot.trading_mode = "paper"
+
+    market_id = market.get("id") or market.get("market_id")
+    key = (maker_bot.name, market_id)
+    if key in traded:
+        return False
+
+    try:
+        # Use analyze() directly to get full maker signal (bid/ask/edge).
+        # We bypass make_decision() because the base class strips maker fields
+        # and applies arena-wide guards (NO-bet ban, high-price guard) that are
+        # not appropriate for a market-maker strategy.
+        signal = maker_bot.analyze(market, signals)
+
+        market_price = market.get("current_price", 0.5)
+        maker_bid = signal.get("maker_bid")
+        maker_ask = signal.get("maker_ask")
+        maker_mid = signal.get("maker_mid")
+        maker_side = signal.get("maker_side", "both")
+        edge_bps = abs((maker_mid or market_price) - market_price) * 10000 if maker_mid is not None else 0.0
+
+        # Always log maker metrics so we can track quoting behaviour over time
+        maker_logger.info(
+            f"[{maker_bot.name}] market={market_id[:12]}... "
+            f"price={market_price:.3f} "
+            f"bid={maker_bid:.3f} ask={maker_ask:.3f} mid={maker_mid:.3f} "
+            f"edge={edge_bps:.1f}bps lean={maker_side} "
+            f"conf={signal.get('confidence', 0.0):.3f}"
+        )
+
+        if signal.get("action") == "hold":
+            # Edge too thin — skip, but still mark as visited this cycle
+            traded.add(key)
+            maker_logger.debug(
+                f"[{maker_bot.name}] HOLD (edge too thin): {signal.get('reasoning', '')}"
+            )
+            return False
+
+        # Paper execute — records a simulated fill via Simmer
+        result = maker_bot.execute(signal, market)
+        traded.add(key)
+
+        if result.get("success"):
+            maker_logger.info(
+                f"[{maker_bot.name}] PAPER {signal['side'].upper()} "
+                f"${signal.get('suggested_amount', 0):.2f} "
+                f"bid={maker_bid:.3f} ask={maker_ask:.3f} edge={edge_bps:.1f}bps "
+                f"on {market.get('question', '')[:50]}"
+            )
+            return True
+        else:
+            maker_logger.debug(
+                f"[{maker_bot.name}] paper execute skipped: {result.get('reason')}"
+            )
+            return False
+
+    except Exception as e:
+        maker_logger.error(f"[{maker_bot.name}] Maker section error on {market_id}: {e}")
+        traded.add(key)
+        return False
+
+
+def _create_copy_bots() -> list:
+    """Instantiate copy-trade bots from DB wallet list.
+
+    Wallets are stored in copytrading_wallets.  Add a wallet via:
+        db.add_copy_wallet("0xABC...", label="Female-Bongo", mode="paper")
+    """
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT address, label, trading_mode FROM copytrading_wallets WHERE active=1"
+        ).fetchall()
+
+    bots = []
+    for r in rows:
+        mode = "paper"
+        try:
+            mode = r["trading_mode"] or "paper"
+        except (IndexError, KeyError):
+            pass
+        bot = CopyBot(
+            wallet_address=r["address"],
+            label=r["label"] or r["address"][:16],
+            mode=mode,
+            max_size=5.0,
+            size_fraction=0.10,
+        )
+        bots.append(bot)
+        logger.info(f"Copy bot: [{bot.label}] wallet={r['address'][:16]}... mode={mode}")
+    return bots
+
+
+def _create_maker_bots():
+    """Instantiate the fixed experimental maker bots.
+
+    These run in parallel with the evolving taker bots but are NOT part of
+    evolution — they persist across cycles so we can compare their long-term
+    performance against each other and against the takers.
+
+    Two competing hypotheses:
+      late-window-maker-v1  — time-gated (final 90s), momentum-confirmed, large bets
+      fee-zone-maker-v1     — always-on, fee-zone-aware, smaller bets, higher frequency
+    """
+    maker_bots = [
+        LateWindowMakerBot(name="late-window-maker-v1"),
+        FeeZoneMakerBot(name="fee-zone-maker-v1"),
+    ]
+    # Persist configs so the dashboard and DB queries can find them
+    existing = {b["bot_name"] for b in db.get_active_bots()}
+    for bot in maker_bots:
+        if bot.name not in existing:
+            db.save_bot_config(
+                bot.name, bot.strategy_type, bot.generation, bot.strategy_params
+            )
+            logger.info(f"Registered maker bot: {bot.name} ({bot.strategy_type})")
+    return maker_bots
 
 
 def resolve_trades(api_key):
@@ -697,11 +843,11 @@ def main_loop(bots, api_key):
     last_resolve_time = 0  # Run immediately on first iteration
 
     # Load recently traded (bot_name, market_id) pairs from DB to prevent
-    # duplicate trades across restarts
+    # duplicate trades across restarts. 1h lookback is enough for 5-min markets.
     traded = set()
     with db.get_conn() as conn:
         recent = conn.execute(
-            "SELECT bot_name, market_id FROM trades WHERE created_at >= datetime('now', '-6 hours')"
+            "SELECT bot_name, market_id FROM trades WHERE created_at >= datetime('now', '-1 hours')"
         ).fetchall()
         for r in recent:
             traded.add((r["bot_name"], r["market_id"]))
@@ -715,6 +861,15 @@ def main_loop(bots, api_key):
         logger.info(f"Multi-account mode: {len(bot_keys)} Simmer accounts loaded")
     else:
         logger.info(f"Single-account mode: {len(bot_keys)} bot keys found (need {config.NUM_BOTS} for independent trading)")
+
+    # Create fixed maker bots (paper-only, not part of evolution)
+    maker_bots = _create_maker_bots()
+    logger.info(f"Maker bots (experimental, paper-only): {[b.name for b in maker_bots]}")
+
+    # Create copy bots (follow tracked wallets)
+    copy_bots = _create_copy_bots()
+    if copy_bots:
+        logger.info(f"Copy bots: {[b.label for b in copy_bots]}")
 
     logger.info(f"Arena started with {len(bots)} bots in {config.get_current_mode()} mode")
     logger.info(f"Bots: {[b.name for b in bots]}")
@@ -760,16 +915,17 @@ def main_loop(bots, api_key):
                 time.sleep(30)
                 continue
 
-            # Filter to strict 5-minute window markets only
-            five_min_markets = [m for m in markets if is_5min_market(m.get("question", ""))]
-            if not five_min_markets:
-                logger.debug(f"Found {len(markets)} BTC markets but none are strict 5-min windows, waiting...")
-                time.sleep(30)
-                continue
+            # Accept all discovered BTC up/down markets regardless of window duration
+            # (Simmer has 5-min, 15-min, hourly, and multi-hour markets — trade whatever is nearest)
+            five_min_markets = markets
 
-            # Compute window age and filter out late-window markets
+            # Filter and select the *next* tradeable BTC market
+            # Window: reject if <60s remaining, reject if >60min away
             now_utc = datetime.now(timezone.utc)
             tradeable_markets = []
+            past_markets = 0
+            future_markets = 0
+
             for m in five_min_markets:
                 resolves_at_str = m.get("resolves_at") or m.get("end_time")
                 if resolves_at_str:
@@ -783,12 +939,20 @@ def main_loop(bots, api_key):
                         m["time_remaining_seconds"] = time_remaining
                         m["window_age_seconds"] = window_age
 
+                        # Reject expired or almost-expired markets
                         if time_remaining < 0:
-                            logger.debug(f"Skipping expired market (remaining={time_remaining:.0f}s): {m.get('question', '')[:50]}")
+                            past_markets += 1
                             continue
-                        if time_remaining < 90:
-                            logger.debug(f"Skipping late-window market (remaining={time_remaining:.0f}s): {m.get('question', '')[:50]}")
+                        if time_remaining < 60:
+                            # <60s remaining — too late to trade reliably
+                            past_markets += 1
                             continue
+
+                        # Reject markets too far in the future (>60 min)
+                        if time_remaining > 3600:
+                            future_markets += 1
+                            continue
+
                     except (ValueError, TypeError) as e:
                         logger.debug(f"Could not parse resolves_at '{resolves_at_str}': {e}")
                         # Still tradeable, just without time context
@@ -797,12 +961,41 @@ def main_loop(bots, api_key):
 
                 tradeable_markets.append(m)
 
+            logger.info(
+                f"Market filter: {len(five_min_markets)} total BTC, "
+                f"{past_markets} expired/too-late, {future_markets} too-far-future (>60min), "
+                f"{len(tradeable_markets)} eligible"
+            )
+
             if not tradeable_markets:
-                logger.debug(f"All {len(five_min_markets)} 5-min markets filtered out (late-window), waiting...")
+                logger.debug("No eligible markets found, waiting...")
                 time.sleep(TRADE_INTERVAL)
                 continue
 
+            # Trade ALL eligible markets, sorted soonest-first
+            tradeable_markets.sort(key=lambda x: x.get("time_remaining_seconds", 999999))
+            selected_market = tradeable_markets[0]  # used for maker section (one market at a time)
+
+            for m in tradeable_markets:
+                mid = m.get("id") or m.get("market_id")
+                tr = m.get("time_remaining_seconds")
+                ct = m.get("resolves_at") or m.get("end_time") or "unknown"
+                price = m.get("current_price", "?")
+                logger.info(
+                    f"  Eligible: {mid[:12]}... p={price:.2f} closes in {tr:.0f}s (at {ct})"
+                )
+
             five_min_markets = tradeable_markets
+
+            # Build token→market index for copy bots (covers all discovered markets)
+            markets_by_token = {}
+            for m in markets:
+                yes_tok = m.get("polymarket_token_id")
+                no_tok = m.get("polymarket_no_token_id")
+                if yes_tok:
+                    markets_by_token[yes_tok] = m
+                if no_tok:
+                    markets_by_token[no_tok] = m
 
             # Gather signals
             price_signals = price_feed.get_signals("btc")
@@ -826,6 +1019,11 @@ def main_loop(bots, api_key):
                         # Skip if bot sees no edge
                         if signal.get("action") == "skip":
                             traded.add(key)
+                            bot_mode = db.get_bot_mode(bot.name)
+                            if bot_mode == "live":
+                                logger.info(f"[{bot.name}] SKIP price={market.get('current_price', 0):.3f} | {signal.get('reasoning', '')}")
+                            else:
+                                logger.debug(f"[{bot.name}] skip | {signal.get('reasoning', '')}")
                             continue
 
                         result = bot.execute(signal, market)
@@ -834,13 +1032,31 @@ def main_loop(bots, api_key):
                             new_trades += 1
                             logger.info(f"[{bot.name}] {signal['side'].upper()} ${signal['suggested_amount']:.2f} (conf={signal['confidence']:.2f}) on {market.get('question', '')[:50]}")
                         else:
-                            logger.debug(f"[{bot.name}] Trade failed on {market_id}: {result.get('reason')}")
+                            logger.warning(f"[{bot.name}] Trade failed on {market_id}: {result.get('reason')}")
                     except Exception as e:
                         logger.error(f"[{bot.name}] Error on {market_id}: {e}")
                         traded.add(key)
 
             if new_trades > 0:
                 logger.info(f"Placed {new_trades} new trades this cycle")
+
+            # --- Maker section (experimental, paper-only) ---
+            # Runs after taker bots so it never blocks taker execution.
+            maker_trades = 0
+            for maker_bot in maker_bots:
+                if run_maker_section(maker_bot, selected_market, combined_signals, traded):
+                    maker_trades += 1
+            if maker_trades > 0:
+                maker_logger.info(f"Maker section placed {maker_trades} paper trades this cycle")
+
+            # --- Copy section (mirror tracked wallets) ---
+            for copy_bot in copy_bots:
+                try:
+                    n = copy_bot.check_and_copy(markets_by_token, api_key)
+                    if n > 0:
+                        logger.info(f"Copy bot [{copy_bot.label}]: mirrored {n} trades this cycle")
+                except Exception as e:
+                    logger.error(f"Copy bot [{copy_bot.label}] error: {e}")
 
             # Position monitor thread polls Simmer every 0.5s for SL/TP
             time.sleep(TRADE_INTERVAL)
@@ -891,10 +1107,11 @@ def main():
     for bot in bots:
         bot.trading_mode = db.get_bot_mode(bot.name)
 
-    # Backfill learning data from old resolved trades that had no trade_features
-    backfilled = learning.backfill_from_resolved_trades()
+    # Backfill learning data only for active bots (not dead bots' stale data)
+    active_names = [b.name for b in bots]
+    backfilled = learning.backfill_from_resolved_trades(bot_names=active_names)
     if backfilled:
-        logger.info(f"Backfilled learning from {backfilled} historical trades")
+        logger.info(f"Backfilled learning from {backfilled} trades for active bots: {active_names}")
 
     main_loop(bots, api_key)
 

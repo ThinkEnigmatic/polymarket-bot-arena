@@ -39,6 +39,7 @@ class BaseBot(ABC):
         "mean_reversion_sl": 0.48,
         "mean_reversion_tp": 0.48,
         "sniper": 0.50,         # neutral — sniper uses its own rules
+        "phantom": 0.52,        # trend-following
         "sentiment": 0.50,      # neutral
         "hybrid": 0.50,         # neutral
     }
@@ -49,20 +50,25 @@ class BaseBot(ABC):
         "mean_reversion_sl": 0.95,
         "mean_reversion_tp": 0.95,
         "sniper": 1.0,          # sniper overrides make_decision entirely
+        "phantom": 1.1,         # trend-following
         "sentiment": 1.0,       # neutral
         "hybrid": 1.0,          # neutral (was 0.9, contrarian loses)
     }
     # Minimum confidence to place a trade
-    # Data: conf <0.25 has ~46% WR and loses money (need >53% WR to break even)
-    # Only conf 0.30-0.50 is reliably profitable (65% WR, +$21)
+    # v6.3: Simmer BTC markets price near 47-55¢ most of the time. At 52¢ the
+    # combined signal peaks at ~0.08 even with strong BTC momentum — so any
+    # threshold above 0.08 means the bot NEVER trades. Lowered aggressively to
+    # let all bots trade and accumulate learning data. "If we never trade we
+    # never get rich." — higher WR thresholds are moot if we place zero trades.
     MIN_TRADE_CONFIDENCE = {
-        "momentum": 0.25,       # was 0.01 — low conf trades lost $37
-        "mean_reversion": 0.25, # was 0.06
-        "mean_reversion_sl": 0.25,
-        "mean_reversion_tp": 0.25,
+        "momentum": 0.05,       # was 0.30 — old data was from more extreme prices
+        "mean_reversion": 0.03,
+        "mean_reversion_sl": 0.03,
+        "mean_reversion_tp": 0.03,
         "sniper": 0.10,         # sniper has its own decision logic
-        "sentiment": 0.25,      # was 0.03
-        "hybrid": 0.25,         # was 0.05
+        "phantom": 0.04,
+        "sentiment": 0.03,
+        "hybrid": 0.03,
     }
 
     def __init__(self, name, strategy_type, params, generation=0, lineage=None):
@@ -132,16 +138,24 @@ class BaseBot(ABC):
             strategy_signal = strategy_yes * raw_signal["confidence"] * 0.15
 
         # --- Signal 4: Learning bias ---
-        features = learning.extract_features(market_price, price_momentum)
+        of_data = signals.get("orderflow", {})
+        volume = of_data.get("volume_24h")
+        time_rem = market.get("time_remaining_seconds")
+        
+        features = learning.extract_features(
+            market_price, price_momentum, 
+            volume=volume, time_rem=time_rem
+        )
         prior = self.STRATEGY_PRIORS.get(self.strategy_type, 0.5)
         learned_yes_bias = learning.get_learned_bias(self.name, features, prior)
         # Convert from 0-1 to -0.5 to +0.5
         learning_signal = (learned_yes_bias - 0.5)
 
         # Dynamic learning weight: ramps up as bot accumulates data
+        # Capped at 0.30 (was 0.60) — stale inherited data was making all bots identical
         perf = db.get_bot_performance(self.name, hours=168)
         total_resolved = perf.get("total_trades", 0)
-        learning_weight = min(0.6, 0.1 + total_resolved * 0.01)
+        learning_weight = min(0.30, 0.05 + total_resolved * 0.005)
 
         # --- Combine all signals ---
         combined = (
@@ -193,17 +207,25 @@ class BaseBot(ABC):
                 "features": features,
             }
 
+        min_conf = self.MIN_TRADE_CONFIDENCE.get(self.strategy_type, 0.03)
+
         # --- Skip low-confidence trades (no edge = no bet) ---
-        min_conf = self.MIN_TRADE_CONFIDENCE.get(self.strategy_type, 0.08)
         if confidence < min_conf:
             return {
                 "action": "skip",
                 "side": side,
                 "confidence": confidence,
-                "reasoning": f"No edge: conf={confidence:.3f} < {min_conf} | price={market_price:.2f}",
+                "reasoning": f"No edge: conf={confidence:.3f} < {min_conf:.3f} | price={market_price:.2f}",
                 "suggested_amount": 0,
                 "features": features,
             }
+
+        # --- Late-window conviction boost ---
+        # BTC direction increasingly locked in during the final 60s of a market.
+        # Boost confidence to better reflect signal certainty at market close.
+        time_rem = market.get("time_remaining_seconds")
+        if time_rem is not None and time_rem < 60:
+            confidence = min(0.95, confidence * 1.25)
 
         # --- Bet sizing: proportional to edge strength ---
         # Data shows: conf 0.30-0.50 is the sweet spot (67.9% WR, +$48).
@@ -244,7 +266,8 @@ class BaseBot(ABC):
         self.trading_mode = db.get_bot_mode(self.name)
         mode = self.trading_mode
         venue = "polymarket" if mode == "live" else "simmer"
-        max_pos = config.get_max_position()
+        # Use per-bot mode for position limits (global config.TRADING_MODE is always "paper")
+        max_pos = config.LIVE_MAX_POSITION if mode == "live" else config.PAPER_MAX_POSITION
 
         # Check risk limits
         daily_loss = db.get_bot_daily_loss(self.name, mode)

@@ -1,22 +1,42 @@
 """FastAPI dashboard backend for the Bot Arena."""
 
 import json
+import secrets
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 import config
 import db
 import learning
 
-app = FastAPI(title="Polymarket Bot Arena Dashboard")
+security = HTTPBasic()
 
-# Balance cache: slot_name -> {"balance": float, "fetched_at": float}
+DASHBOARD_USER = "admin"
+DASHBOARD_PASS = "Hemingway"
+
+
+def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_user = secrets.compare_digest(credentials.username, DASHBOARD_USER)
+    correct_pass = secrets.compare_digest(credentials.password, DASHBOARD_PASS)
+    if not (correct_user and correct_pass):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+app = FastAPI(title="Polymarket Bot Arena Dashboard", dependencies=[Depends(verify_auth)])
+
+# Balance cache: key -> {"balance": float, "fetched_at": float}
 _balance_cache = {}
 BALANCE_CACHE_TTL = 60  # seconds
 
@@ -38,20 +58,62 @@ def _fetch_slot_balance(api_key):
     return None
 
 
-def get_bot_balance(slot_name, bot_keys):
-    """Get cached or fresh balance for a bot slot."""
+def get_bot_balance(slot_name, bot_keys, trading_mode="paper"):
+    """Get cached or fresh balance for a bot slot. Live bots show Polymarket USDC balance."""
+    cache_key = "polymarket_live" if trading_mode == "live" else slot_name
     now = time.time()
-    cached = _balance_cache.get(slot_name)
+    cached = _balance_cache.get(cache_key)
     if cached and (now - cached["fetched_at"]) < BALANCE_CACHE_TTL:
-        return cached["balance"]
+        return cached["balance"], trading_mode == "live"
+
+    if trading_mode == "live":
+        try:
+            import hmac as _hmac
+            import hashlib as _hashlib
+            import base64 as _base64
+            import json as _json
+            import requests as _req
+            from pathlib import Path as _Path
+            with open(_Path.home() / ".config/polymarket/credentials.json") as f:
+                creds = _json.load(f)
+            api_key = creds["api_key"]
+            api_secret = creds["api_secret"]
+            api_passphrase = creds["api_passphrase"]
+            signer_address = creds["signer_address"]
+            # Build HMAC signature for Level 2 auth
+            # signature_type=1 = POLY_PROXY (queries funder/proxy wallet balance)
+            ts = str(int(time.time()))
+            msg = ts + "GET" + "/balance-allowance"
+            secret_bytes = _base64.urlsafe_b64decode(api_secret)
+            sig = _base64.urlsafe_b64encode(
+                _hmac.new(secret_bytes, msg.encode(), _hashlib.sha256).digest()
+            ).decode()
+            headers = {
+                "POLY_ADDRESS": signer_address,
+                "POLY_SIGNATURE": sig,
+                "POLY_TIMESTAMP": ts,
+                "POLY_API_KEY": api_key,
+                "POLY_PASSPHRASE": api_passphrase,
+            }
+            resp = _req.get(
+                "https://clob.polymarket.com/balance-allowance"
+                "?asset_type=COLLATERAL&signature_type=1",
+                headers=headers, timeout=10,
+            )
+            data = resp.json()
+            raw = data.get("balance", "0") if isinstance(data, dict) else "0"
+            balance = int(raw) / 1e6
+        except Exception:
+            balance = None
+        _balance_cache[cache_key] = {"balance": balance, "fetched_at": now}
+        return balance, True
 
     api_key = bot_keys.get(slot_name)
     if not api_key:
-        return None
-
+        return None, False
     balance = _fetch_slot_balance(api_key)
-    _balance_cache[slot_name] = {"balance": balance, "fetched_at": now}
-    return balance
+    _balance_cache[cache_key] = {"balance": balance, "fetched_at": now}
+    return balance, False
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -154,8 +216,17 @@ async def get_bots():
                 cfg["params"] = json.loads(cfg["params"])
             except (json.JSONDecodeError, TypeError):
                 pass
-        perf_12h = db.get_bot_performance(cfg["bot_name"], hours=12)
-        perf_24h = db.get_bot_performance(cfg["bot_name"], hours=24)
+        trading_mode = db.get_bot_mode(cfg["bot_name"])
+        is_live = trading_mode == "live"
+
+        # Live bots: show all-time live-only stats; paper bots: show 12h/24h paper stats
+        if is_live:
+            perf_12h = db.get_bot_performance(cfg["bot_name"], hours=None, mode="live")
+            perf_24h = perf_12h  # same — all live trades
+        else:
+            perf_12h = db.get_bot_performance(cfg["bot_name"], hours=12)
+            perf_24h = db.get_bot_performance(cfg["bot_name"], hours=24)
+
         trades = db.get_bot_trades(cfg["bot_name"], limit=10)
         # Count pending (unresolved) trades so dashboard shows activity
         with db.get_conn() as conn:
@@ -165,12 +236,19 @@ async def get_bots():
             ).fetchone()
             pending_count = dict(row)["c"]
 
-        # Per-bot trading mode
-        trading_mode = db.get_bot_mode(cfg["bot_name"])
-
-        # Wallet balance from Simmer
+        # Balance: Polymarket USDC for live bots, Simmer SIM for paper bots
         slot_name = f"slot_{i}"
-        balance = get_bot_balance(slot_name, bot_keys)
+        balance, balance_is_live = get_bot_balance(slot_name, bot_keys, trading_mode)
+
+        # For live bots, include the trading key address so dashboard can show where to deposit
+        trading_key_address = None
+        if trading_mode == "live":
+            try:
+                with open(config.POLYMARKET_KEY_PATH) as f:
+                    pk_creds = json.load(f)
+                trading_key_address = pk_creds.get("signer_address")
+            except Exception:
+                pass
 
         result.append({
             "config": cfg,
@@ -180,6 +258,8 @@ async def get_bots():
             "pending_trades": pending_count,
             "trading_mode": trading_mode,
             "balance": balance,
+            "balance_is_live": balance_is_live,
+            "trading_key_address": trading_key_address,
         })
     return JSONResponse(result)
 
@@ -213,14 +293,37 @@ async def get_trades(bot: str = None, limit: int = 50):
 
 @app.get("/api/copytrading")
 async def get_copytrading():
-    from copytrading.copier import TradeCopier
-    from copytrading.tracker import WalletTracker
-    tracker = WalletTracker()
-    copier = TradeCopier(tracker)
-    return JSONResponse({
-        "wallets": tracker.get_tracked(),
-        "stats": copier.get_copy_stats(),
-    })
+    wallets = db.list_copy_wallets()
+    result = []
+    for w in wallets:
+        bot_name = f"copy-{w['label']}"
+        with db.get_conn() as conn:
+            perf = conn.execute(
+                """SELECT COUNT(*) as total,
+                          SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) as wins,
+                          SUM(CASE WHEN outcome='loss' THEN 1 ELSE 0 END) as losses,
+                          ROUND(SUM(pnl), 2) as pnl
+                   FROM trades WHERE bot_name=?""",
+                (bot_name,),
+            ).fetchone()
+            recent = conn.execute(
+                """SELECT side, amount, market_question, outcome, pnl, created_at
+                   FROM trades WHERE bot_name=? ORDER BY created_at DESC LIMIT 5""",
+                (bot_name,),
+            ).fetchall()
+        p = dict(perf)
+        total = (p.get("wins") or 0) + (p.get("losses") or 0)
+        result.append({
+            "wallet": w["address"],
+            "label": w["label"],
+            "mode": w.get("trading_mode", "paper"),
+            "total_trades": p.get("total") or 0,
+            "resolved_trades": total,
+            "win_rate": (p.get("wins") or 0) / total if total > 0 else None,
+            "pnl": p.get("pnl") or 0,
+            "recent_trades": [dict(r) for r in recent],
+        })
+    return JSONResponse(result)
 
 
 @app.get("/api/earnings")

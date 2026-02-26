@@ -18,7 +18,7 @@ DEFAULT_PARAMS = {
     "min_price_yes": 0.40,     # Min YES price for YES bets
     "max_price_yes": 0.78,     # Max YES price for YES bets (was 0.85 — 80c+ lost money)
     "max_price_no": 0.25,      # Max YES price for NO bets (was 0.35 — 30-35c lost, only <25c won)
-    "skip_zone_low": 0.45,     # Start of coin-flip dead zone (was 0.48)
+    "skip_zone_low": 0.48,     # Start of coin-flip dead zone (cheap-YES 40-48¢ has 100% WR)
     "skip_zone_high": 0.64,    # End of coin-flip dead zone (was 0.58 — 58-65c was 20% WR)
     "require_momentum": True,  # Only trade when BTC momentum confirms
     "momentum_threshold": 0.0003,  # Tighter threshold (was 0.0005 hardcoded)
@@ -63,7 +63,14 @@ class SniperBot(BaseBot):
         if len(prices) >= 2 and prices[-1] > 0:
             btc_momentum = (prices[-1] - prices[-2]) / prices[-2]
 
-        features = learning.extract_features(market_price, btc_momentum)
+        of_data = signals.get("orderflow", {})
+        volume = of_data.get("volume_24h")
+        time_rem = market.get("time_remaining_seconds")
+
+        features = learning.extract_features(
+            market_price, btc_momentum,
+            volume=volume, time_rem=time_rem
+        )
 
         # --- Rule 1: Skip coin-flip zone (50-58c) ---
         if skip_lo <= market_price <= skip_hi:
@@ -101,14 +108,16 @@ class SniperBot(BaseBot):
             confidence = 0.15 + (market_price - 0.50) * 1.5
             reasoning_parts.append(f"strong-YES zone ({market_price:.0%})")
 
-        # NO zone: <35c
+        # NO zone: banned — NO bets lose at all confidence levels (44% WR, -$132 all-time)
         elif market_price <= max_no:
-            side = "no"
-            confidence = 0.25 + (0.50 - market_price) * 2.0
-            reasoning_parts.append(f"strong-NO zone ({market_price:.0%})")
+            return {
+                "action": "skip", "side": "no", "confidence": 0,
+                "reasoning": f"sniper: NO ban (price={market_price:.2f} in NO zone, but NO bets lose money)",
+                "suggested_amount": 0, "features": features,
+            }
 
         else:
-            # 35-40c: marginal zone, skip
+            # 25-40c: marginal zone, skip
             return {
                 "action": "skip", "side": "yes", "confidence": 0,
                 "reasoning": f"sniper: marginal zone price={market_price:.2f}",
@@ -155,16 +164,25 @@ class SniperBot(BaseBot):
 
         # --- Early-window boost ---
         window_age = market.get("window_age_seconds")
-        if window_age is not None and window_age < 90:
+        if window_age is not None and 0 <= window_age < 90:
             confidence *= 1.25
             confidence = min(0.95, confidence)
             reasoning_parts.append(f"early-window-boost(age={window_age:.0f}s)")
 
+        # --- Late-window boost ---
+        # Mirror of early-window: BTC direction increasingly certain in final 60s.
+        time_rem = market.get("time_remaining_seconds")
+        if time_rem is not None and 0 < time_rem < 60:
+            confidence = min(0.95, confidence * 1.30)
+            reasoning_parts.append(f"late-window-boost(rem={time_rem:.0f}s)")
+
         # --- Position sizing ---
         max_pos = config.get_max_position()
         size_pct = p.get("position_size_pct", 0.08)
-        if window_age is not None and window_age < 90:
+        if window_age is not None and 0 <= window_age < 90:
             size_pct *= 1.2  # Larger positions in early window
+        if time_rem is not None and 0 < time_rem < 60:
+            size_pct *= 1.2  # Larger positions in late window too
         amount = max_pos * size_pct * (0.5 + confidence)
         amount = min(amount, max_pos)
 

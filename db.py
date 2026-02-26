@@ -106,11 +106,16 @@ def init_db():
             );
         """)
 
-        # Migration: add trading_mode column to bot_configs
-        try:
-            conn.execute("ALTER TABLE bot_configs ADD COLUMN trading_mode TEXT DEFAULT 'paper'")
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+        # Migrations
+        for migration in [
+            "ALTER TABLE bot_configs ADD COLUMN trading_mode TEXT DEFAULT 'paper'",
+            "ALTER TABLE copytrading_trades ADD COLUMN source_tx_hash TEXT",
+            "ALTER TABLE copytrading_wallets ADD COLUMN trading_mode TEXT DEFAULT 'paper'",
+        ]:
+            try:
+                conn.execute(migration)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
 
 
 @contextmanager
@@ -163,19 +168,28 @@ def get_bot_trades(bot_name, hours=None, limit=50):
         return [dict(r) for r in rows]
 
 
-def get_bot_performance(bot_name, hours=12):
+def get_bot_performance(bot_name, hours=12, mode=None):
+    """Get bot performance stats. hours=None means all-time. mode filters by trading mode."""
     with get_conn() as conn:
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-        row = conn.execute("""
+        conditions = ["bot_name=?", "outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')"]
+        params = [bot_name]
+        if hours is not None:
+            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            conditions.append("created_at>=?")
+            params.append(cutoff)
+        if mode is not None:
+            conditions.append("mode=?")
+            params.append(mode)
+        where = " AND ".join(conditions)
+        row = conn.execute(f"""
             SELECT
                 COUNT(*) as total_trades,
                 SUM(CASE WHEN outcome IN ('win', 'exit_tp') THEN 1 ELSE 0 END) as wins,
                 SUM(CASE WHEN outcome IN ('loss', 'exit_sl') THEN 1 ELSE 0 END) as losses,
                 COALESCE(SUM(pnl), 0) as total_pnl,
                 COALESCE(AVG(pnl), 0) as avg_pnl
-            FROM trades
-            WHERE bot_name=? AND created_at>=? AND outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')
-        """, (bot_name, cutoff)).fetchone()
+            FROM trades WHERE {where}
+        """, params).fetchone()
         result = dict(row)
         result["wins"] = result["wins"] or 0
         result["losses"] = result["losses"] or 0
@@ -224,6 +238,38 @@ def retire_bot(bot_name):
             "UPDATE bot_configs SET active=0, retired_at=datetime('now') WHERE bot_name=? AND active=1",
             (bot_name,)
         )
+
+
+def add_copy_wallet(address: str, label: str = None, mode: str = "paper"):
+    """Add or reactivate a wallet to copy-trade. mode: 'paper' or 'live'."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO copytrading_wallets (address, label, trading_mode, active)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(address) DO UPDATE SET
+                 label=excluded.label,
+                 trading_mode=excluded.trading_mode,
+                 active=1""",
+            (address.lower(), label or address[:16], mode),
+        )
+
+
+def remove_copy_wallet(address: str):
+    """Stop copying a wallet (soft delete)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE copytrading_wallets SET active=0 WHERE address=?",
+            (address.lower(),),
+        )
+
+
+def list_copy_wallets():
+    """Return all active copy-trade wallets."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT address, label, trading_mode, tracked_since FROM copytrading_wallets WHERE active=1"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def get_active_bots():
