@@ -28,6 +28,7 @@ from bots.bot_copy import CopyBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
 from signals.orderflow import get_feed as get_orderflow_feed
+from signals.polymarket_prices import get_feed as get_pm_price_feed
 from copytrading.tracker import WalletTracker
 from copytrading.copier import TradeCopier
 
@@ -817,6 +818,7 @@ def main_loop(bots, api_key):
     price_feed = get_price_feed()
     sentiment_feed = get_sentiment_feed()
     orderflow_feed = get_orderflow_feed()
+    pm_price_feed = get_pm_price_feed()
 
     price_feed.start()
     sentiment_feed.start()
@@ -1005,7 +1007,20 @@ def main_loop(bots, api_key):
             for market in five_min_markets:
                 market_id = market.get("id") or market.get("market_id")
                 of_signals = orderflow_feed.get_signals(market_id, api_key)
-                combined_signals = {**price_signals, **sent_signals, **of_signals}
+
+                # Polymarket YES price momentum — rate of change in the market's
+                # own prediction price over the last few minutes
+                yes_token = market.get("polymarket_token_id", "")
+                pm_data = pm_price_feed.get_momentum(yes_token) if yes_token else {}
+                pm_signals = {"pm_momentum": pm_data.get("momentum", 0.0),
+                              "pm_prices": pm_data.get("prices", [])}
+                if pm_data.get("fresh") and pm_data.get("prices"):
+                    logger.debug(
+                        f"PM momentum for {market.get('question','')[:40]}: "
+                        f"{pm_data['momentum']:+.4f} prices={pm_data['prices']}"
+                    )
+
+                combined_signals = {**price_signals, **sent_signals, **of_signals, **pm_signals}
 
                 # Each bot trades independently on its own account
                 for bot in bots:

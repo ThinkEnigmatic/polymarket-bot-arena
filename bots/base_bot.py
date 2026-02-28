@@ -157,10 +157,19 @@ class BaseBot(ABC):
         total_resolved = perf.get("total_trades", 0)
         learning_weight = min(0.30, 0.05 + total_resolved * 0.005)
 
+        # --- Signal 4b: Polymarket in-market price momentum ---
+        # Rate of change of the YES price on Polymarket itself (from price history API).
+        # Distinct from BTC spot momentum — this captures how *traders in this market*
+        # are actually positioning, which can lead or lag BTC spot price.
+        pm_momentum_raw = signals.get("pm_momentum", 0.0)
+        pm_momentum_signal = max(-0.15, min(0.15, float(pm_momentum_raw)))
+
         # --- Combine all signals ---
+        # Rebalanced: PM momentum takes 10% from BTC momentum (most similar signal)
         combined = (
             price_edge * 0.50 +           # Market price is primary signal
-            momentum_signal * 0.20 +       # BTC momentum is secondary
+            momentum_signal * 0.15 +       # BTC spot momentum (Binance candles)
+            pm_momentum_signal * 0.10 +    # Polymarket YES price momentum (in-market)
             strategy_signal * 0.15 +       # Strategy adds differentiation
             learning_signal * learning_weight  # Learning grows over time
         )
@@ -242,7 +251,8 @@ class BaseBot(ABC):
 
         reasoning = (
             f"price={market_price:.2f} edge={price_edge:+.3f} "
-            f"mom={momentum_signal:+.3f} strat={strategy_signal:+.3f} "
+            f"mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
+            f"strat={strategy_signal:+.3f} "
             f"learn={learning_signal:+.3f}(w={learning_weight:.0%}) "
             f"=> {side} conf={confidence:.2f}"
         )
