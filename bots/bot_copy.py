@@ -310,9 +310,24 @@ class CopyBot:
             return False
 
         market_id = market.get("id") or market.get("market_id")
+
+        # Simmer fill-price guard: reject if Simmer's current market price already
+        # exceeds max_price — this catches the case where Female-Bongo buys at 0.52
+        # on Polymarket but Simmer has diverged to 0.98 (different AMM state).
+        # Without this check we'd lock in a terrible entry: risk $0.98 to win $0.02.
+        simmer_price = market.get("current_price", 0.5)
+        simmer_side_price = simmer_price if side == "yes" else (1.0 - simmer_price)
+        if simmer_side_price > self.max_price:
+            logger.info(
+                f"CopyBot [{self.label}]: skipping — Simmer fill ~{simmer_side_price:.2f} "
+                f"> max {self.max_price:.2f} (whale paid {price:.2f}) ({title[:40]})"
+            )
+            self.seen_keys.add(key)
+            return False
+
         reasoning = (
             f"copy:{self.label} {side} {outcome} @ {price:.2f} "
-            f"(whale ${usdc_size:.2f} → us ${amount:.2f})"
+            f"(whale ${usdc_size:.2f} → us ${amount:.2f}, simmer~{simmer_side_price:.2f})"
         )
 
         # Always mark as seen before executing to prevent double-trade on retry
