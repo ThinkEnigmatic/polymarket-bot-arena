@@ -40,7 +40,7 @@ class CopyBot:
         mode: str = "paper",
         max_size: float = 5.0,
         size_fraction: float = 0.10,
-        daily_spend_limit: float = None,
+        daily_loss_limit: float = None,
         max_per_cycle: int = None,
     ):
         self.wallet = wallet_address.lower()
@@ -49,7 +49,7 @@ class CopyBot:
         self.max_size = max_size  # cap per copied trade in USDC
         self.size_fraction = size_fraction  # fraction of whale's USDC size to copy
         self.name = f"copy-{self.label}"
-        self.daily_spend_limit = daily_spend_limit if daily_spend_limit is not None else config.COPYTRADING_DAILY_SPEND_LIMIT
+        self.daily_loss_limit = daily_loss_limit if daily_loss_limit is not None else config.COPYTRADING_DAILY_LOSS_LIMIT
         self.max_per_cycle = max_per_cycle if max_per_cycle is not None else config.COPYTRADING_MAX_TRADES_PER_CYCLE
         self.min_price = config.COPYTRADING_MIN_PRICE
         self.max_price = getattr(config, 'COPYTRADING_MAX_PRICE', 1.0)
@@ -81,14 +81,18 @@ class CopyBot:
         except Exception as e:
             logger.warning(f"CopyBot [{self.label}]: could not load seen keys: {e}")
 
-    def _get_today_spend(self) -> float:
-        """Return total USDC spent copying today (UTC calendar day)."""
+    def _get_today_losses(self) -> float:
+        """Return total realized losses from copy trades today (UTC calendar day).
+
+        Only counts resolved losing trades — wins don't count toward the limit,
+        giving unlimited upside while capping downside at daily_loss_limit.
+        """
         try:
             with db.get_conn() as conn:
                 row = conn.execute(
-                    "SELECT COALESCE(SUM(amount), 0) FROM copytrading_trades "
-                    "WHERE wallet_address=? AND date(created_at)=date('now')",
-                    (self.wallet,),
+                    "SELECT COALESCE(SUM(ABS(pnl)), 0) FROM trades "
+                    "WHERE bot_name=? AND outcome='loss' AND date(created_at)=date('now')",
+                    (self.name,),
                 ).fetchone()
                 return float(row[0])
         except Exception:
@@ -348,12 +352,12 @@ class CopyBot:
 
         logger.info(f"CopyBot [{self.label}]: {len(new_trades)} new trades detected")
 
-        # Check daily spend cap before doing anything
-        today_spend = self._get_today_spend()
-        if today_spend >= self.daily_spend_limit:
+        # Check daily loss cap before doing anything (wins are unlimited, losses are capped)
+        today_losses = self._get_today_losses()
+        if today_losses >= self.daily_loss_limit:
             logger.warning(
-                f"CopyBot [{self.label}]: daily spend limit reached "
-                f"(${today_spend:.2f} / ${self.daily_spend_limit:.2f}), skipping cycle"
+                f"CopyBot [{self.label}]: daily loss limit reached "
+                f"(${today_losses:.2f} losses / ${self.daily_loss_limit:.2f} cap), skipping cycle"
             )
             # Still mark all new trades as seen so we don't retry them tomorrow
             for trade in new_trades:
@@ -370,13 +374,12 @@ class CopyBot:
                 )
                 break
 
-            # Re-check spend before each trade
-            today_spend = self._get_today_spend()
-            remaining = self.daily_spend_limit - today_spend
-            if remaining < 1.0:
+            # Re-check losses before each trade
+            today_losses = self._get_today_losses()
+            if today_losses >= self.daily_loss_limit:
                 logger.warning(
-                    f"CopyBot [{self.label}]: daily spend limit reached mid-cycle "
-                    f"(${today_spend:.2f} / ${self.daily_spend_limit:.2f})"
+                    f"CopyBot [{self.label}]: daily loss limit reached mid-cycle "
+                    f"(${today_losses:.2f} losses / ${self.daily_loss_limit:.2f} cap)"
                 )
                 break
 
