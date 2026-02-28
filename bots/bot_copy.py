@@ -82,19 +82,25 @@ class CopyBot:
             logger.warning(f"CopyBot [{self.label}]: could not load seen keys: {e}")
 
     def _get_today_losses(self) -> float:
-        """Return total realized losses from copy trades today (UTC calendar day).
+        """Return today's loss exposure: resolved losses + pending at-risk amount.
 
-        Only counts resolved losing trades — wins don't count toward the limit,
-        giving unlimited upside while capping downside at daily_loss_limit.
+        Pending trades are counted at full bet size (worst-case) so burst trading
+        can't race past the daily cap before markets resolve.  Once pending trades
+        resolve as wins their amount drops out of the counter automatically.
         """
         try:
             with db.get_conn() as conn:
-                row = conn.execute(
+                resolved = conn.execute(
                     "SELECT COALESCE(SUM(ABS(pnl)), 0) FROM trades "
                     "WHERE bot_name=? AND outcome='loss' AND date(created_at)=date('now')",
                     (self.name,),
-                ).fetchone()
-                return float(row[0])
+                ).fetchone()[0]
+                pending = conn.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM trades "
+                    "WHERE bot_name=? AND outcome IS NULL AND date(created_at)=date('now')",
+                    (self.name,),
+                ).fetchone()[0]
+                return float(resolved) + float(pending)
         except Exception:
             return 0.0
 
@@ -211,6 +217,19 @@ class CopyBot:
         """Execute directly on Polymarket CLOB using the exact token."""
         try:
             import polymarket_client
+
+            # Pre-flight: check actual CLOB best ask before placing.
+            # Simmer and CLOB prices diverge — the Simmer guard alone isn't enough.
+            # If the CLOB book is empty or best ask already > max_price, abort.
+            book = polymarket_client.get_market_info(token_id)
+            clob_ask = book.get("best_ask", 1.0)
+            if not book or clob_ask > self.max_price:
+                logger.info(
+                    f"CopyBot [{self.label}]: aborting live order — "
+                    f"CLOB ask {clob_ask:.2f} > max {self.max_price:.2f}"
+                )
+                return False, None
+
             result = polymarket_client.place_market_order(token_id, side, amount)
             if result.get("success"):
                 trade_id = result.get("order_id", "")
