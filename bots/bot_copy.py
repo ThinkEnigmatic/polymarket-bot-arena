@@ -87,18 +87,33 @@ class CopyBot:
         Pending trades are counted at full bet size (worst-case) so burst trading
         can't race past the daily cap before markets resolve.  Once pending trades
         resolve as wins their amount drops out of the counter automatically.
+
+        Respects a manual reset: if a reset timestamp was stored in arena_state
+        for today, only losses AFTER that timestamp are counted.
         """
         try:
+            from datetime import date
+            reset_key = f"copy_loss_reset_{self.name}_{date.today()}"
+            since = db.get_arena_state(reset_key)  # None or "YYYY-MM-DD HH:MM:SS"
+            if since:
+                time_filter = "AND created_at >= ?"
+                params_resolved = (self.name, since)
+                params_pending  = (self.name, since)
+            else:
+                time_filter = "AND date(created_at)=date('now')"
+                params_resolved = (self.name,)
+                params_pending  = (self.name,)
+
             with db.get_conn() as conn:
                 resolved = conn.execute(
-                    "SELECT COALESCE(SUM(ABS(pnl)), 0) FROM trades "
-                    "WHERE bot_name=? AND outcome='loss' AND date(created_at)=date('now')",
-                    (self.name,),
+                    f"SELECT COALESCE(SUM(ABS(pnl)), 0) FROM trades "
+                    f"WHERE bot_name=? AND outcome='loss' {time_filter}",
+                    params_resolved,
                 ).fetchone()[0]
                 pending = conn.execute(
-                    "SELECT COALESCE(SUM(amount), 0) FROM trades "
-                    "WHERE bot_name=? AND outcome IS NULL AND date(created_at)=date('now')",
-                    (self.name,),
+                    f"SELECT COALESCE(SUM(amount), 0) FROM trades "
+                    f"WHERE bot_name=? AND outcome IS NULL {time_filter}",
+                    params_pending,
                 ).fetchone()[0]
                 return float(resolved) + float(pending)
         except Exception:
