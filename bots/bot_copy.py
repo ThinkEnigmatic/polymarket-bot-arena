@@ -233,6 +233,20 @@ class CopyBot:
 
         # --- Filters (mark seen so we don't retry skipped trades) ---
 
+        # Age filter: skip trades older than 5 minutes — stale copies fill at
+        # the current (often near-resolution) market price, not the whale's entry
+        # price, destroying the edge. e.g. whale bought at 0.45, we copy 10 min
+        # later, Simmer fills at 0.98 → +$0.02 win but -$1.00 loss = EV-negative.
+        trade_ts = activity.get("timestamp", 0)
+        trade_age = time.time() - trade_ts if trade_ts else 999
+        if trade_age > 300:  # 5 minutes
+            logger.info(
+                f"CopyBot [{self.label}]: skipping — trade too old "
+                f"({trade_age:.0f}s > 300s) ({title[:40]})"
+            )
+            self.seen_keys.add(key)
+            return False
+
         # Hour filter: skip blocked UTC hours
         current_hour = datetime.now(timezone.utc).hour
         if current_hour in self.blocked_hours:
