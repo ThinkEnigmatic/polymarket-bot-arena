@@ -473,6 +473,26 @@ def _create_copy_bots() -> list:
     return bots
 
 
+def _start_wallet_monitors(copy_bots: list):
+    """Attach a real-time WalletMonitor to each copy bot and start it.
+
+    Each monitor subscribes to Polygon newHeads (~2s block time) and
+    immediately polls Polymarket activity on every block.  This reduces
+    copy-trade latency from ~30s (polling) to ~2-5s (event-driven).
+    Falls back to 15s polling if the WebSocket is unavailable.
+    """
+    try:
+        from signals.wallet_monitor import WalletMonitor
+    except ImportError as e:
+        logger.warning(f"WalletMonitor unavailable ({e}) — using polling fallback")
+        return
+
+    for bot in copy_bots:
+        monitor = WalletMonitor(bot.wallet, label=bot.label)
+        bot.attach_monitor(monitor)
+        monitor.start()
+
+
 def _create_maker_bots():
     """Instantiate the fixed experimental maker bots.
 
@@ -868,10 +888,11 @@ def main_loop(bots, api_key):
     maker_bots = _create_maker_bots()
     logger.info(f"Maker bots (experimental, paper-only): {[b.name for b in maker_bots]}")
 
-    # Create copy bots (follow tracked wallets)
+    # Create copy bots (follow tracked wallets) + attach real-time monitors
     copy_bots = _create_copy_bots()
     if copy_bots:
         logger.info(f"Copy bots: {[b.label for b in copy_bots]}")
+        _start_wallet_monitors(copy_bots)
 
     logger.info(f"Arena started with {len(bots)} bots in {config.get_current_mode()} mode")
     logger.info(f"Bots: {[b.name for b in bots]}")
@@ -911,6 +932,30 @@ def main_loop(bots, api_key):
 
             # Discover active markets (any key works for read-only)
             markets = discover_markets(api_key)
+
+            # --- Copy section (runs every cycle regardless of BTC market availability) ---
+            # Build token→market index from whatever markets Simmer has right now.
+            # Even when there are no tradeable BTC windows, copy bots should still
+            # drain their monitor queues and process any freshly detected whale trades.
+            if copy_bots:
+                copy_markets_by_token: dict = {}
+                for _m in (markets or []):
+                    _yt = _m.get("polymarket_token_id")
+                    _nt = _m.get("polymarket_no_token_id")
+                    if _yt:
+                        copy_markets_by_token[_yt] = _m
+                    if _nt:
+                        copy_markets_by_token[_nt] = _m
+                for copy_bot in copy_bots:
+                    try:
+                        n = copy_bot.check_and_copy(copy_markets_by_token, api_key)
+                        if n > 0:
+                            logger.info(
+                                f"Copy bot [{copy_bot.label}]: mirrored {n} trades this cycle"
+                            )
+                    except Exception as e:
+                        logger.error(f"Copy bot [{copy_bot.label}] error: {e}")
+
             if not markets:
                 logger.debug("No active 5-min markets found, waiting...")
                 # Position monitor thread handles SL/TP independently
@@ -1063,15 +1108,6 @@ def main_loop(bots, api_key):
                     maker_trades += 1
             if maker_trades > 0:
                 maker_logger.info(f"Maker section placed {maker_trades} paper trades this cycle")
-
-            # --- Copy section (mirror tracked wallets) ---
-            for copy_bot in copy_bots:
-                try:
-                    n = copy_bot.check_and_copy(markets_by_token, api_key)
-                    if n > 0:
-                        logger.info(f"Copy bot [{copy_bot.label}]: mirrored {n} trades this cycle")
-                except Exception as e:
-                    logger.error(f"Copy bot [{copy_bot.label}] error: {e}")
 
             # Position monitor thread polls Simmer every 0.5s for SL/TP
             time.sleep(TRADE_INTERVAL)

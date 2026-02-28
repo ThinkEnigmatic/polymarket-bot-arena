@@ -59,6 +59,7 @@ class CopyBot:
         # Dedup: load previously seen {tx_hash}:{asset} keys from DB
         self.seen_keys: set[str] = set()
         self._load_seen_keys()
+        self._monitor = None  # WalletMonitor (set via attach_monitor)
         logger.info(
             f"CopyBot [{self.label}] init: mode={mode} max=${max_size} "
             f"fraction={size_fraction:.0%} seen={len(self.seen_keys)} past trades"
@@ -105,6 +106,17 @@ class CopyBot:
                 )
         except Exception as e:
             logger.warning(f"CopyBot [{self.label}]: DB log failed: {e}")
+
+    def attach_monitor(self, monitor):
+        """Attach a WalletMonitor for real-time trade detection.
+
+        When attached, check_and_copy() drains the monitor's queue instead of
+        polling the activity API directly.  The monitor is pre-seeded with our
+        seen_keys so it won't re-queue trades we've already processed.
+        """
+        self._monitor = monitor
+        monitor.seed_seen_keys(self.seen_keys)
+        logger.info(f"CopyBot [{self.label}]: real-time monitor attached ✓")
 
     # ── Activity polling ──────────────────────────────────────────────────────
 
@@ -326,7 +338,11 @@ class CopyBot:
 
     def check_and_copy(self, markets_by_token: dict, api_key: str) -> int:
         """Check for new wallet trades and copy them. Returns number of trades placed."""
-        new_trades = self.fetch_new_trades()
+        # Prefer monitor queue (real-time, ~2-5s lag) over direct polling (~30s lag)
+        if self._monitor is not None:
+            new_trades = self._monitor.drain_queue()
+        else:
+            new_trades = self.fetch_new_trades()
         if not new_trades:
             return 0
 
