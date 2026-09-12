@@ -47,6 +47,9 @@ maker_logger = logging.getLogger("arena.maker")
 TRADE_INTERVAL = 15    # Discover markets + place trades every 15s (fast market discovery)
 RESOLVE_INTERVAL = 60  # Resolve trades + expire stale every 60s (expensive, no need to rush)
 FAST_POLL_INTERVAL = 0.5  # Poll market prices for SL/TP exits every 0.5s
+MARKET_WINDOW_SECONDS = 300
+MIN_ENTRY_SECONDS_REMAINING = 60
+MARKET_CLOCK_SKEW_GRACE_SECONDS = 5
 
 
 def create_default_bots():
@@ -87,64 +90,23 @@ def create_default_bots():
     return [
         MomentumBot(name="momentum-v1", generation=0),
         HybridBot(name="hybrid-v1", generation=0),
-        MeanRevSLBot(name="meanrev-sl25-v1", generation=0),
+        SniperBot(name="sniper-v1", generation=0),
         PhantomBot(name="phantom-v1", generation=0),
     ]
 
 
-def create_evolved_bot(winner, loser_type, gen_number):
-    """Create an evolved bot based on the winner's influence + loser's strategy.
+def create_evolved_bot(winner, gen_number):
+    """Create a mutated child of the profitable strategy that won.
 
-    Uses the loser strategy's DEFAULT params as a base, copies over any
-    shared keys from the winner (e.g. lookback_candles, position_size_pct),
-    then mutates. This prevents KeyError when winner and loser have
-    different param schemas.
+    Evolution previously recreated the losing strategy type, which meant a
+    winning family could never reproduce. A child now inherits both the
+    winner's class and its full parameter schema before mutation.
     """
-    from bots.bot_momentum import DEFAULT_PARAMS as MOMENTUM_DEFAULTS
-    from bots.bot_mean_rev import DEFAULT_PARAMS as MEANREV_DEFAULTS
-    from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
-    from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
-
-    from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
-    from bots.bot_phantom import DEFAULT_PARAMS as PHANTOM_DEFAULTS
-
-    bot_classes = {
-        "momentum": MomentumBot,
-        "mean_reversion": MeanRevBot,
-        "mean_reversion_sl": MeanRevSLBot,
-        "mean_reversion_tp": MeanRevTPBot,
-        "sniper": SniperBot,
-        "phantom": PhantomBot,
-        "sentiment": SentimentBot,
-        "hybrid": HybridBot,
-    }
-
-    default_params_map = {
-        "momentum": MOMENTUM_DEFAULTS,
-        "mean_reversion": MEANREV_DEFAULTS,
-        "mean_reversion_sl": MEANREV_DEFAULTS,
-        "mean_reversion_tp": MEANREV_DEFAULTS,
-        "sniper": SNIPER_DEFAULTS,
-        "phantom": PHANTOM_DEFAULTS,
-        "sentiment": SENTIMENT_DEFAULTS,
-        "hybrid": HYBRID_DEFAULTS,
-    }
-
-    # Start with the target strategy's defaults
-    base_params = default_params_map.get(loser_type, MOMENTUM_DEFAULTS).copy()
-
-    # Copy shared keys from winner (transfers learned tuning for common params)
     winner_params = winner.export_params()["params"]
-    for key in base_params:
-        if key in winner_params:
-            base_params[key] = winner_params[key]
+    new_params = winner.mutate(winner_params)
+    name = f"{winner.strategy_type}-g{gen_number}-{random.randint(100,999)}"
 
-    # Mutate
-    new_params = winner.mutate(base_params)
-    name = f"{loser_type}-g{gen_number}-{random.randint(100,999)}"
-
-    cls = bot_classes.get(loser_type, MomentumBot)
-    return cls(
+    return type(winner)(
         name=name,
         params=new_params,
         generation=gen_number,
@@ -159,14 +121,14 @@ def _validate_bot(bot):
     dummy_signals = {"prices": [97000, 97050, 97100], "latest": 97100}
     try:
         result = bot.make_decision(dummy_market, dummy_signals)
-        return result.get("action") in ("buy", "skip")
+        return result.get("action") in ("buy", "skip", "hold")
     except Exception as e:
         logger.error(f"  VALIDATION FAILED for {bot.name}: {e}")
         return False
 
 
 def run_evolution(bots, cycle_number):
-    """Run evolution cycle — kill bots below WR threshold, mutate from survivors."""
+    """Replace sufficiently tested money-losers with profitable offspring."""
     logger.info(f"=== Evolution Cycle {cycle_number} ===")
 
     # Gather performance and classify by WR
@@ -178,26 +140,30 @@ def run_evolution(bots, cycle_number):
             "strategy_type": bot.strategy_type,
             "generation": bot.generation,
             "pnl": perf["total_pnl"],
+            "avg_pnl": perf.get("avg_pnl", 0),
             "win_rate": perf["win_rate"],
             "trades": perf["total_trades"],
         })
 
-    # Sort by WR (not P&L) for ranking display
-    rankings.sort(key=lambda x: x["win_rate"], reverse=True)
+    # Entry price changes the breakeven win rate, so dollars earned—not raw
+    # win rate—is the selection objective.
+    rankings.sort(
+        key=lambda x: (x["pnl"], x["avg_pnl"], x["win_rate"]), reverse=True
+    )
 
     # Classify bots
     immune = []       # <MIN_TRADES resolved trades — not enough data
-    above = []        # WR >= MIN_WIN_RATE with enough trades — survive
-    below = []        # WR < MIN_WIN_RATE with enough trades — get replaced
+    above = []        # Positive P&L with enough trades — survive and reproduce
+    below = []        # Non-positive P&L with enough trades — get replaced
     for r in rankings:
         if r["trades"] < config.MIN_TRADES_FOR_JUDGMENT:
             immune.append(r)
-        elif r["win_rate"] >= config.MIN_WIN_RATE:
+        elif r["pnl"] > 0:
             above.append(r)
         else:
             below.append(r)
 
-    logger.info("Rankings (WR-based):")
+    logger.info("Rankings (P&L-based):")
     for r in rankings:
         if r in immune:
             status = "IMMUNE"
@@ -207,11 +173,15 @@ def run_evolution(bots, cycle_number):
             status = "REPLACED"
         logger.info(f"  {r['name']}: WR={r['win_rate']:.1%}, P&L=${r['pnl']:.2f}, Trades={r['trades']} [{status}]")
 
-    # Safety net: if ALL would be killed (no immune + no above), keep best 1 by WR
-    if not immune and not above and below:
-        best = below.pop(0)  # rankings already sorted by WR desc, so first in below is best
+    # Safety net: if all tested bots lost money, keep the least-bad one as the
+    # parent rather than attempting to reproduce from an untested bot.
+    if not above and below:
+        best = below.pop(0)
         above.append(best)
-        logger.info(f"  Safety net: keeping {best['name']} (best WR {best['win_rate']:.1%}) as sole survivor")
+        logger.info(
+            f"  Safety net: keeping {best['name']} "
+            f"(best P&L ${best['pnl']:.2f}) as sole parent"
+        )
 
     # If nobody needs replacing, early return
     if not below:
@@ -230,12 +200,13 @@ def run_evolution(bots, cycle_number):
             new_bots.append(bot)
 
     # Create replacements from winners
-    winners = [b for b in bots if b.name in survivor_names]
+    winner_names = {r["name"] for r in above}
+    winners = [b for b in bots if b.name in winner_names]
     replaced = [b for b in bots if b.name in replaced_names]
 
     for dead_bot in replaced:
         parent = random.choice(winners)
-        evolved = create_evolved_bot(parent, dead_bot.strategy_type, cycle_number)
+        evolved = create_evolved_bot(parent, cycle_number)
 
         # Inherit the dead bot's API key slot so evolved bot uses same Simmer account
         if hasattr(dead_bot, '_api_key_slot'):
@@ -244,29 +215,13 @@ def run_evolution(bots, cycle_number):
 
         # Validate the new bot can actually trade before committing
         if not _validate_bot(evolved):
-            logger.warning(f"  {evolved.name} failed validation, recreating with pure defaults")
-            from bots.bot_momentum import DEFAULT_PARAMS as MOMENTUM_DEFAULTS
-            from bots.bot_mean_rev import DEFAULT_PARAMS as MEANREV_DEFAULTS
-            from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
-            from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
-            from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
-            from bots.bot_phantom import DEFAULT_PARAMS as PHANTOM_DEFAULTS
-            fallback_map = {
-                "momentum": MOMENTUM_DEFAULTS, "mean_reversion": MEANREV_DEFAULTS,
-                "mean_reversion_sl": MEANREV_DEFAULTS, "mean_reversion_tp": MEANREV_DEFAULTS,
-                "sniper": SNIPER_DEFAULTS, "phantom": PHANTOM_DEFAULTS,
-                "sentiment": SENTIMENT_DEFAULTS, "hybrid": HYBRID_DEFAULTS,
-            }
-            bot_classes = {
-                "momentum": MomentumBot, "mean_reversion": MeanRevBot,
-                "mean_reversion_sl": MeanRevSLBot, "mean_reversion_tp": MeanRevTPBot,
-                "sniper": SniperBot, "phantom": PhantomBot,
-                "sentiment": SentimentBot, "hybrid": HybridBot,
-            }
-            cls = bot_classes.get(dead_bot.strategy_type, MomentumBot)
-            fallback_params = fallback_map.get(dead_bot.strategy_type, MOMENTUM_DEFAULTS).copy()
-            evolved = cls(
-                name=evolved.name, params=fallback_params,
+            logger.warning(
+                f"  {evolved.name} failed validation, recreating as an "
+                "unmutated copy of its parent"
+            )
+            evolved = type(parent)(
+                name=evolved.name,
+                params=parent.export_params()["params"],
                 generation=cycle_number, lineage=f"{parent.name} -> {evolved.name} (fallback)",
             )
             if hasattr(dead_bot, '_api_key_slot'):
@@ -325,8 +280,7 @@ def discover_markets(api_key):
             for m in markets_list:
                 q = m.get("question", "").lower()
                 has_btc = "btc" in q or "bitcoin" in q
-                has_5min = any(kw in q for kw in config.TARGET_MARKET_KEYWORDS)
-                if has_btc and has_5min:
+                if has_btc and is_5min_market(q):
                     markets.append(m)
     except Exception as e:
         logger.error(f"Market discovery error: {e}")
@@ -339,7 +293,11 @@ def is_5min_market(question):
     import re
     q = question.lower()
     # Match patterns like "10:00PM-10:05PM" (5-min range)
-    range_match = re.search(r'(\d{1,2}):(\d{2})(am|pm)-(\d{1,2}):(\d{2})(am|pm)', q)
+    range_match = re.search(
+        r'(\d{1,2}):(\d{2})\s*(am|pm)\s*[-–]\s*'
+        r'(\d{1,2}):(\d{2})\s*(am|pm)',
+        q,
+    )
     if range_match:
         h1, m1 = int(range_match.group(1)), int(range_match.group(2))
         h2, m2 = int(range_match.group(4)), int(range_match.group(5))
@@ -352,7 +310,48 @@ def is_5min_market(question):
         diff = (h2 * 60 + m2) - (h1 * 60 + m1)
         if diff < 0: diff += 24 * 60
         return diff == 5
-    return False
+    return any(marker in q for marker in ("5 min", "5-min", "5min", "5 minute"))
+
+
+def filter_tradeable_markets(markets, now_utc=None):
+    """Keep only markets whose actual five-minute window is active.
+
+    Signals observed now are not predictive inputs for a market whose window
+    starts later. Missing or unparseable resolution times therefore fail closed.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    tradeable = []
+    too_late = 0
+    not_started = 0
+    invalid_time = 0
+
+    for market in markets:
+        resolves_at_str = market.get("resolves_at") or market.get("end_time")
+        if not resolves_at_str:
+            invalid_time += 1
+            continue
+        try:
+            normalized = resolves_at_str.replace("Z", "+00:00").replace(" ", "T")
+            resolves_at = datetime.fromisoformat(normalized)
+            if resolves_at.tzinfo is None:
+                resolves_at = resolves_at.replace(tzinfo=timezone.utc)
+            time_remaining = (resolves_at - now_utc).total_seconds()
+        except (AttributeError, ValueError, TypeError):
+            invalid_time += 1
+            continue
+
+        market["time_remaining_seconds"] = time_remaining
+        market["window_age_seconds"] = max(0, MARKET_WINDOW_SECONDS - time_remaining)
+
+        if time_remaining < MIN_ENTRY_SECONDS_REMAINING:
+            too_late += 1
+            continue
+        if time_remaining > MARKET_WINDOW_SECONDS + MARKET_CLOCK_SKEW_GRACE_SECONDS:
+            not_started += 1
+            continue
+        tradeable.append(market)
+
+    return tradeable, too_late, not_started, invalid_time
 
 
 def expire_stale_trades():
@@ -361,7 +360,8 @@ def expire_stale_trades():
     with db.get_conn() as conn:
         count = conn.execute('''
             UPDATE trades SET outcome = 'expired', pnl = 0, resolved_at = datetime('now')
-            WHERE outcome IS NULL AND created_at < datetime('now', '-1 hour')
+            WHERE outcome IS NULL AND mode = 'paper'
+              AND created_at < datetime('now', '-1 hour')
         ''').rowcount
     if count > 0:
         logger.info(f"Expired {count} stale trades (>1h old, never resolved)")
@@ -419,8 +419,14 @@ def run_maker_section(maker_bot, market, signals, traded):
             )
             return False
 
-        # Paper execute — records a simulated fill via Simmer
-        result = maker_bot.execute(signal, market)
+        # Execute the experiment directly on Simmer. Calling execute() would
+        # re-read a dashboard mode toggle and could accidentally route this
+        # explicitly paper-only experiment to the live CLOB.
+        max_pos = config.get_max_position("paper")
+        amount = min(signal.get("suggested_amount", max_pos * 0.5), max_pos)
+        result = maker_bot._execute_paper(
+            signal, market, amount, "simmer", "paper"
+        )
         traded.add(key)
 
         if result.get("success"):
@@ -664,14 +670,11 @@ def assign_bot_slots(bots, bot_keys, default_key):
 
 
 class PositionMonitorThread(threading.Thread):
-    """Background thread that polls Simmer for market prices every 0.5s.
+    """Dormant monitor retained until venue-backed sell execution is added.
 
-    Monitors all open positions belonging to bots with exit strategies
-    (stop_loss, take_profit). When a position hits its SL/TP threshold,
-    closes it immediately in the DB and logs the exit.
-
-    The thread fetches active market prices from Simmer in a single API call
-    per tick, then checks all open positions against those prices.
+    Updating only the database does not close a Simmer or Polymarket position.
+    Synthetic SL/TP accounting is therefore disabled to keep recorded P&L and
+    actual exposure consistent.
     """
 
     def __init__(self, api_key):
@@ -682,9 +685,16 @@ class PositionMonitorThread(threading.Thread):
         self._lock = threading.Lock()
 
     def update_bots(self, bots):
-        """Update the bot roster (called from main thread after evolution)."""
+        """Reject synthetic exit strategies until actual sell orders exist."""
+        requested = [b.name for b in bots if b.exit_strategy]
         with self._lock:
-            self._bots = {b.name: b for b in bots if b.exit_strategy}
+            self._bots = {}
+        if requested:
+            logger.warning(
+                "SL/TP monitor disabled for %s: no venue-backed exit order "
+                "implementation; positions will hold to resolution",
+                requested,
+            )
 
     def stop(self):
         self._stop_event.set()
@@ -898,7 +908,7 @@ def main_loop(bots, api_key):
     logger.info(f"Bots: {[b.name for b in bots]}")
     logger.info(f"Evolution every {config.EVOLUTION_INTERVAL_HOURS}h")
 
-    # Start fast position monitor thread (polls Simmer every 0.5s for SL/TP)
+    # The monitor remains dormant until venue-backed exit orders are implemented.
     pos_monitor = PositionMonitorThread(api_key)
     pos_monitor.update_bots(bots)
     pos_monitor.start()
@@ -916,7 +926,7 @@ def main_loop(bots, api_key):
                 traded.clear()
                 # Re-assign slots — new bots inherit the killed bot's slot index
                 assign_bot_slots(bots, bot_keys, api_key)
-                # Update position monitor with new bot roster
+                # Keep synthetic exit accounting disabled after evolution.
                 pos_monitor.update_bots(bots)
 
             # Resolve completed trades + expire stale (throttled to every 60s)
@@ -958,59 +968,17 @@ def main_loop(bots, api_key):
 
             if not markets:
                 logger.debug("No active 5-min markets found, waiting...")
-                # Position monitor thread handles SL/TP independently
                 time.sleep(30)
                 continue
 
-            # Accept all discovered BTC up/down markets regardless of window duration
-            # (Simmer has 5-min, 15-min, hourly, and multi-hour markets — trade whatever is nearest)
-            five_min_markets = markets
-
-            # Filter and select the *next* tradeable BTC market
-            # Window: reject if <60s remaining, reject if >60min away
-            now_utc = datetime.now(timezone.utc)
-            tradeable_markets = []
-            past_markets = 0
-            future_markets = 0
-
-            for m in five_min_markets:
-                resolves_at_str = m.get("resolves_at") or m.get("end_time")
-                if resolves_at_str:
-                    try:
-                        # Parse ISO format: "2026-02-17 03:10:00Z" or "2026-02-17T03:10:00Z"
-                        rat = resolves_at_str.replace("Z", "+00:00").replace(" ", "T")
-                        resolves_at = datetime.fromisoformat(rat)
-                        time_remaining = (resolves_at - now_utc).total_seconds()
-                        window_age = 300 - time_remaining  # 5-min windows = 300s
-
-                        m["time_remaining_seconds"] = time_remaining
-                        m["window_age_seconds"] = window_age
-
-                        # Reject expired or almost-expired markets
-                        if time_remaining < 0:
-                            past_markets += 1
-                            continue
-                        if time_remaining < 60:
-                            # <60s remaining — too late to trade reliably
-                            past_markets += 1
-                            continue
-
-                        # Reject markets too far in the future (>60 min)
-                        if time_remaining > 3600:
-                            future_markets += 1
-                            continue
-
-                    except (ValueError, TypeError) as e:
-                        logger.debug(f"Could not parse resolves_at '{resolves_at_str}': {e}")
-                        # Still tradeable, just without time context
-                        m["time_remaining_seconds"] = None
-                        m["window_age_seconds"] = None
-
-                tradeable_markets.append(m)
+            tradeable_markets, past_markets, future_markets, invalid_markets = (
+                filter_tradeable_markets(markets)
+            )
 
             logger.info(
-                f"Market filter: {len(five_min_markets)} total BTC, "
-                f"{past_markets} expired/too-late, {future_markets} too-far-future (>60min), "
+                f"Market filter: {len(markets)} strict BTC 5-min, "
+                f"{past_markets} expired/too-late, {future_markets} not-started, "
+                f"{invalid_markets} invalid-time, "
                 f"{len(tradeable_markets)} eligible"
             )
 
@@ -1109,7 +1077,6 @@ def main_loop(bots, api_key):
             if maker_trades > 0:
                 maker_logger.info(f"Maker section placed {maker_trades} paper trades this cycle")
 
-            # Position monitor thread polls Simmer every 0.5s for SL/TP
             time.sleep(TRADE_INTERVAL)
 
         except KeyboardInterrupt:
@@ -1158,11 +1125,23 @@ def main():
     for bot in bots:
         bot.trading_mode = db.get_bot_mode(bot.name)
 
-    # Backfill learning data only for active bots (not dead bots' stale data)
+    # Repair one historic replay bug: older releases learned feature-less trades
+    # again on every restart. Rebuild active counters once from trade ground truth.
     active_names = [b.name for b in bots]
-    backfilled = learning.backfill_from_resolved_trades(bot_names=active_names)
-    if backfilled:
-        logger.info(f"Backfilled learning from {backfilled} trades for active bots: {active_names}")
+    if db.get_arena_state("learning_rebuild_v8") != "complete":
+        rebuilt = learning.rebuild_from_resolved_trades(bot_names=active_names)
+        db.set_arena_state("learning_rebuild_v8", "complete")
+        logger.info(
+            f"Rebuilt learning from {rebuilt} resolved trades for active bots: "
+            f"{active_names}"
+        )
+    else:
+        backfilled = learning.backfill_from_resolved_trades(bot_names=active_names)
+        if backfilled:
+            logger.info(
+                f"Backfilled learning from {backfilled} trades for active bots: "
+                f"{active_names}"
+            )
 
     main_loop(bots, api_key)
 

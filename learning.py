@@ -8,11 +8,14 @@ decisions, the bot queries its learned win rates to bias yes/no.
 
 import math
 import logging
-from datetime import datetime
+import json
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import db
 
 logger = logging.getLogger(__name__)
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 # Feature buckets
 PRICE_BUCKETS = [
@@ -81,7 +84,7 @@ def extract_features(market_price, price_momentum, hour_et=None, volume=None, ti
 
     # Hour bucket
     if hour_et is None:
-        hour_et = (datetime.utcnow().hour - 5) % 24  # UTC to ET approx
+        hour_et = datetime.now(EASTERN_TZ).hour
     for name, start, end in HOUR_BUCKETS:
         if start < end:
             if start <= hour_et < end:
@@ -201,7 +204,7 @@ def record_outcome(bot_name, features, side, won):
                     """, (bot_name, feat))
 
 
-def extract_features_from_reasoning(reasoning):
+def extract_features_from_reasoning(reasoning, hour_et=None):
     """Try to extract features from the reasoning text of old trades.
 
     Parses v4-format reasoning like:
@@ -231,7 +234,7 @@ def extract_features_from_reasoning(reasoning):
             market_price = float(m.group(1))
 
     if market_price is not None:
-        return extract_features(market_price, momentum or 0.0)
+        return extract_features(market_price, momentum or 0.0, hour_et=hour_et)
     return None
 
 
@@ -267,23 +270,113 @@ def backfill_from_resolved_trades(bot_names=None):
 
     count = 0
     for r in rows:
-        features = extract_features_from_reasoning(r["reasoning"])
+        hour_et = None
+        try:
+            created_at = datetime.strptime(
+                r["created_at"], "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+            hour_et = created_at.astimezone(EASTERN_TZ).hour
+        except (TypeError, ValueError):
+            pass
+
+        features = extract_features_from_reasoning(
+            r["reasoning"], hour_et=hour_et
+        )
         if not features:
             # Last resort: use hour from created_at as the only feature
             try:
-                hour_utc = int(r["created_at"].split(" ")[1].split(":")[0])
-                hour_et = (hour_utc - 5) % 24
+                if hour_et is None:
+                    raise ValueError("invalid created_at")
                 features = extract_features(0.5, 0.0, hour_et)  # neutral price bucket
-            except (IndexError, ValueError):
+            except ValueError:
                 continue
 
         won = r["outcome"] == "win"
         record_outcome(r["bot_name"], features, r["side"], won)
+        # Persist reconstructed features so this trade is never learned twice
+        # on subsequent process restarts.
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE trades SET trade_features=? WHERE id=?",
+                (json.dumps(features), r["id"]),
+            )
         count += 1
 
     if count > 0:
         logger.info(f"Backfilled learning from {count} resolved trades")
     return count
+
+
+def rebuild_from_resolved_trades(bot_names=None):
+    """Rebuild learning counters once from resolved-trade ground truth.
+
+    Older versions replayed feature-less trades on every restart, inflating
+    their influence. Rebuilding removes those duplicate counts and makes each
+    resolved trade contribute exactly once.
+    """
+    params = []
+    where = "outcome IN ('win', 'loss')"
+    if bot_names is not None:
+        if not bot_names:
+            return 0
+        placeholders = ",".join("?" for _ in bot_names)
+        where += f" AND bot_name IN ({placeholders})"
+        params.extend(bot_names)
+
+    with db.get_conn() as conn:
+        if bot_names is None:
+            conn.execute("DELETE FROM bot_learning")
+        else:
+            placeholders = ",".join("?" for _ in bot_names)
+            conn.execute(
+                f"DELETE FROM bot_learning WHERE bot_name IN ({placeholders})",
+                bot_names,
+            )
+        rows = conn.execute(
+            f"""SELECT id, bot_name, side, outcome, reasoning,
+                       trade_features, created_at
+                FROM trades WHERE {where}
+                ORDER BY id""",
+            params,
+        ).fetchall()
+
+    rebuilt = 0
+    for row in rows:
+        features = None
+        if row["trade_features"]:
+            try:
+                features = json.loads(row["trade_features"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if not features:
+            hour_et = None
+            try:
+                created_at = datetime.strptime(
+                    row["created_at"], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=timezone.utc)
+                hour_et = created_at.astimezone(EASTERN_TZ).hour
+            except (TypeError, ValueError):
+                pass
+            features = extract_features_from_reasoning(
+                row["reasoning"], hour_et=hour_et
+            )
+
+        if not features:
+            continue
+
+        record_outcome(
+            row["bot_name"], features, row["side"], row["outcome"] == "win"
+        )
+        if not row["trade_features"]:
+            with db.get_conn() as conn:
+                conn.execute(
+                    "UPDATE trades SET trade_features=? WHERE id=?",
+                    (json.dumps(features), row["id"]),
+                )
+        rebuilt += 1
+
+    return rebuilt
 
 
 def get_bot_learning_summary(bot_name):

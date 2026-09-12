@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 from py_order_utils.model import POLY_PROXY
 
@@ -63,56 +63,111 @@ def get_market_info(token_id: str) -> dict:
         return {
             "bids": book.bids if book.bids else [],
             "asks": book.asks if book.asks else [],
-            "best_bid": float(book.bids[0].price) if book.bids else 0,
-            "best_ask": float(book.asks[0].price) if book.asks else 1,
+            # The client returns book levels in API order, which is not a safe
+            # contract for identifying top-of-book by index.
+            "best_bid": max(float(level.price) for level in book.bids) if book.bids else 0,
+            "best_ask": min(float(level.price) for level in book.asks) if book.asks else 1,
         }
     except Exception as e:
         logger.error(f"Market info error: {e}")
         return {}
 
 
-def place_market_order(token_id: str, side: str, amount: float) -> dict:
-    """Place a market buy order on Polymarket.
+def place_market_order(
+    token_id: str,
+    side: str,
+    amount: float,
+    *,
+    max_price: float | None = None,
+) -> dict:
+    """Place a fill-or-kill market buy and report the actual fill.
 
     Args:
         token_id: The YES or NO token ID from the market
         side: "yes" or "no"
         amount: USDC amount to spend
+        max_price: Optional maximum acceptable token price
     """
     try:
+        amount = float(amount)
+        if not math.isfinite(amount) or amount <= 0:
+            return {"success": False, "error": "Amount must be a positive finite number"}
+
         client = get_client()
 
-        # Get the best price from the order book
+        # Refuse an empty book and enforce the caller's slippage ceiling before
+        # signing. The ceiling is also embedded in the market-order arguments.
         book = client.get_order_book(token_id)
+        if not book.asks:
+            return {"success": False, "error": "No asks in order book"}
+        best_ask = min(float(level.price) for level in book.asks)
 
-        if side.lower() == "yes":
-            # Buying YES tokens — take the best ask
-            if not book.asks:
-                return {"success": False, "error": "No asks in order book"}
-            price = float(book.asks[0].price)
-        else:
-            # Buying NO tokens — the NO token_id should be used
-            if not book.asks:
-                return {"success": False, "error": "No asks in order book"}
-            price = float(book.asks[0].price)
+        if max_price is not None:
+            max_price = float(max_price)
+            if not math.isfinite(max_price) or not 0 < max_price < 1:
+                return {"success": False, "error": "max_price must be between 0 and 1"}
+            if best_ask > max_price:
+                return {
+                    "success": False,
+                    "error": f"Best ask {best_ask:.4f} exceeds max price {max_price:.4f}",
+                }
 
-        # Build and sign the order
-        order_args = OrderArgs(
-            price=price,
-            size=math.ceil(amount / price * 100) / 100,  # Round UP so cost >= amount (avoids $0.9999 rejection)
-            side=BUY,
+        order_args = MarketOrderArgs(
             token_id=token_id,
+            amount=round(amount, 2),
+            side=BUY,
+            price=max_price or 0,
+            order_type=OrderType.FOK,
         )
 
-        signed_order = client.create_order(order_args)
-        result = client.post_order(signed_order, OrderType.GTC)
+        signed_order = client.create_market_order(order_args)
+        result = client.post_order(signed_order, OrderType.FOK)
+        status = str(result.get("status", "")).lower()
+        matched = bool(result.get("success")) and status == "matched"
 
-        logger.info(f"Polymarket order placed: {side} ${amount} at {price}")
+        if not matched:
+            # FOK should never rest, but defensively cancel any unexpected live
+            # order rather than leave capital reserved off-book from our state.
+            order_id = result.get("orderID")
+            if order_id and status in {"live", "delayed"}:
+                try:
+                    client.cancel(order_id)
+                except Exception as cancel_error:
+                    logger.critical(
+                        f"Could not cancel unexpected {status} FOK order "
+                        f"{order_id}: {cancel_error}"
+                    )
+            error = result.get("errorMsg") or f"Order was not fully matched (status={status or 'unknown'})"
+            return {"success": False, "error": error, "result": result}
+
+        try:
+            # CLOB order responses use six-decimal token base units.
+            amount_spent = int(result["makingAmount"]) / 1e6
+            shares_received = int(result["takingAmount"]) / 1e6
+        except (KeyError, TypeError, ValueError):
+            logger.critical(f"Matched order response omitted fill amounts: {result}")
+            return {
+                "success": False,
+                "error": "Matched order response omitted fill amounts; reconcile manually",
+                "result": result,
+            }
+
+        if amount_spent <= 0 or shares_received <= 0:
+            return {"success": False, "error": "CLOB returned invalid fill amounts", "result": result}
+
+        fill_price = amount_spent / shares_received
+
+        logger.info(
+            f"Polymarket FOK matched: {side} ${amount_spent:.2f} "
+            f"at {fill_price:.4f} ({shares_received:.4f} shares)"
+        )
         return {
             "success": True,
             "order_id": result.get("orderID"),
-            "price": price,
-            "size": order_args.size,
+            "price": fill_price,
+            "size": shares_received,
+            "amount_spent": amount_spent,
+            "status": status,
             "result": result,
         }
 

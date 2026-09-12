@@ -16,6 +16,7 @@ so we don't re-copy trades across arena restarts.
 """
 
 import logging
+import math
 import sys
 import time
 from datetime import datetime, timezone
@@ -116,8 +117,10 @@ class CopyBot:
                     params_pending,
                 ).fetchone()[0]
                 return float(resolved) + float(pending)
-        except Exception:
-            return 0.0
+        except Exception as e:
+            # A database failure must stop new risk, not silently disable the cap.
+            logger.error(f"CopyBot [{self.label}]: risk calculation failed: {e}")
+            return float("inf")
 
     def _log_copy_trade(self, market_id: str, side: str, amount: float,
                         our_trade_id: str, source_key: str):
@@ -219,13 +222,13 @@ class CopyBot:
                     trade_id=trade_id,
                     shares_bought=shares_bought,
                 )
-                return True, trade_id
+                return True, trade_id, amount
             else:
                 logger.error(f"CopyBot [{self.label}]: Simmer trade failed {resp.status_code}: {resp.text[:150]}")
-                return False, None
+                return False, None, 0.0
         except Exception as e:
             logger.error(f"CopyBot [{self.label}]: paper execute error: {e}")
-            return False, None
+            return False, None, 0.0
 
     def _execute_live(self, token_id: str, market_id: str,
                       market_question: str, side: str, amount: float, reasoning: str):
@@ -243,32 +246,41 @@ class CopyBot:
                     f"CopyBot [{self.label}]: aborting live order — "
                     f"CLOB ask {clob_ask:.2f} > max {self.max_price:.2f}"
                 )
-                return False, None
+                return False, None, 0.0
 
-            result = polymarket_client.place_market_order(token_id, side, amount)
+            result = polymarket_client.place_market_order(
+                token_id, side, amount, max_price=self.max_price
+            )
             if result.get("success"):
                 trade_id = result.get("order_id", "")
+                amount_spent = result.get("amount_spent", amount)
                 db.log_trade(
                     bot_name=self.name,
                     market_id=market_id,
                     market_question=market_question,
                     side=side,
-                    amount=amount,
+                    amount=amount_spent,
                     venue="polymarket",
                     mode="live",
                     reasoning=reasoning,
                     trade_id=trade_id,
                     shares_bought=result.get("size"),
                 )
-                return True, trade_id
+                return True, trade_id, amount_spent
             else:
                 logger.error(f"CopyBot [{self.label}]: CLOB trade failed: {result.get('error')}")
-                return False, None
+                return False, None, 0.0
         except Exception as e:
             logger.error(f"CopyBot [{self.label}]: live execute error: {e}")
-            return False, None
+            return False, None, 0.0
 
-    def _execute_one(self, activity: dict, markets_by_token: dict, api_key: str) -> bool:
+    def _execute_one(
+        self,
+        activity: dict,
+        markets_by_token: dict,
+        api_key: str,
+        remaining_risk: float = float("inf"),
+    ) -> bool:
         """Execute a single copied trade. Returns True on success."""
         key = activity["_key"]
         asset = activity.get("asset", "")
@@ -325,7 +337,16 @@ class CopyBot:
             return False
 
         # Position size: fraction of whale's trade, capped
-        amount = round(min(self.max_size, max(1.0, usdc_size * self.size_fraction)), 2)
+        desired_amount = min(self.max_size, max(1.0, usdc_size * self.size_fraction))
+        # Round down so cent rounding can never cross the remaining daily cap.
+        amount = math.floor(min(desired_amount, remaining_risk) * 100) / 100
+        if amount < 1.0:
+            logger.info(
+                f"CopyBot [{self.label}]: skipping — only ${remaining_risk:.2f} "
+                "daily risk budget remains"
+            )
+            self.seen_keys.add(key)
+            return False
 
         # Find the Simmer market via token lookup
         market = markets_by_token.get(asset)
@@ -368,18 +389,18 @@ class CopyBot:
         self.seen_keys.add(key)
 
         if self.mode == "live":
-            success, trade_id = self._execute_live(
+            success, trade_id, filled_amount = self._execute_live(
                 asset, market_id, title, side, amount, reasoning
             )
         else:
-            success, trade_id = self._execute_paper(
+            success, trade_id, filled_amount = self._execute_paper(
                 market_id, title, side, amount, reasoning, api_key
             )
 
         if success:
-            self._log_copy_trade(market_id, side, amount, trade_id or "", key)
+            self._log_copy_trade(market_id, side, filled_amount, trade_id or "", key)
             logger.info(
-                f"CopyBot [{self.label}] ✓ {side.upper()} ${amount:.2f} "
+                f"CopyBot [{self.label}] ✓ {side.upper()} ${filled_amount:.2f} "
                 f"(whale ${usdc_size:.2f} × {self.size_fraction:.0%}) "
                 f"on {title[:50]}"
             )
@@ -432,7 +453,10 @@ class CopyBot:
                 )
                 break
 
-            if self._execute_one(trade, markets_by_token, api_key):
+            remaining_risk = self.daily_loss_limit - today_losses
+            if self._execute_one(
+                trade, markets_by_token, api_key, remaining_risk=remaining_risk
+            ):
                 count += 1
                 time.sleep(0.5)  # small delay between consecutive live orders
 

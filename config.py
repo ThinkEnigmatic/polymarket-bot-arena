@@ -22,7 +22,7 @@ POLYMARKET_HOST = "https://clob.polymarket.com"
 POLYMARKET_CHAIN_ID = 137  # Polygon
 
 # Database
-DB_PATH = Path(__file__).parent / "bot_arena.db"
+DB_PATH = Path(os.environ.get("BOT_ARENA_DB_PATH", Path(__file__).parent / "bot_arena.db"))
 
 # Target Market: BTC 5-min up/down
 TARGET_MARKET_QUERY = "btc"  # Search term for market discovery
@@ -39,6 +39,7 @@ PAPER_STARTING_BALANCE = 10000.0  # $SIM
 LIVE_MAX_POSITION = 10.0  # USDC per trade
 LIVE_MAX_DAILY_LOSS_PER_BOT = 50.0  # USDC
 LIVE_MAX_DAILY_LOSS_TOTAL = 100.0  # USDC
+LIVE_MAX_PRICE_DRIFT = 0.02  # Reject if CLOB ask is >2c above observed market price
 
 # General Risk Rules (both modes)
 MAX_POSITION_PCT_OF_BALANCE = 0.10  # Never bet more than 10% of balance
@@ -81,19 +82,26 @@ def get_current_mode():
     return TRADING_MODE
 
 
-def get_max_position():
-    """Get max position size based on current mode"""
-    return LIVE_MAX_POSITION if TRADING_MODE == "live" else PAPER_MAX_POSITION
+def _effective_mode(mode=None):
+    """Resolve an explicit per-bot mode, falling back to the global default."""
+    if mode is not None and mode not in ("paper", "live"):
+        raise ValueError("Mode must be 'paper' or 'live'")
+    return mode or TRADING_MODE
 
 
-def get_max_daily_loss_per_bot():
-    """Get max daily loss per bot based on current mode"""
-    return LIVE_MAX_DAILY_LOSS_PER_BOT if TRADING_MODE == "live" else PAPER_MAX_DAILY_LOSS_PER_BOT
+def get_max_position(mode=None):
+    """Get max position size for an explicit per-bot mode."""
+    return LIVE_MAX_POSITION if _effective_mode(mode) == "live" else PAPER_MAX_POSITION
 
 
-def get_max_daily_loss_total():
-    """Get max total daily loss based on current mode"""
-    return LIVE_MAX_DAILY_LOSS_TOTAL if TRADING_MODE == "live" else PAPER_MAX_DAILY_LOSS_TOTAL
+def get_max_daily_loss_per_bot(mode=None):
+    """Get max daily loss per bot for an explicit per-bot mode."""
+    return LIVE_MAX_DAILY_LOSS_PER_BOT if _effective_mode(mode) == "live" else PAPER_MAX_DAILY_LOSS_PER_BOT
+
+
+def get_max_daily_loss_total(mode=None):
+    """Get max total daily loss for an explicit per-bot mode."""
+    return LIVE_MAX_DAILY_LOSS_TOTAL if _effective_mode(mode) == "live" else PAPER_MAX_DAILY_LOSS_TOTAL
 
 
 def get_venue():

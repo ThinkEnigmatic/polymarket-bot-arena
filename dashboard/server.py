@@ -1,6 +1,7 @@
 """FastAPI dashboard backend for the Bot Arena."""
 
 import json
+import os
 import secrets
 import sys
 import time
@@ -18,8 +19,13 @@ import learning
 
 security = HTTPBasic()
 
-DASHBOARD_USER = "admin"
-DASHBOARD_PASS = __import__("os").environ.get("ARENA_DASHBOARD_PASSWORD", "")
+DASHBOARD_USER = os.environ.get("ARENA_DASHBOARD_USER", "admin")
+DASHBOARD_PASS = os.environ.get("ARENA_DASHBOARD_PASSWORD")
+
+if not DASHBOARD_PASS:
+    raise RuntimeError(
+        "ARENA_DASHBOARD_PASSWORD must be set before starting the dashboard"
+    )
 
 
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):

@@ -156,21 +156,36 @@ class BtcMakerBot(BaseBot):
         self.trading_mode = db.get_bot_mode(self.name)
         mode = self.trading_mode
 
-        # Standard risk checks (inherited logic)
-        daily_loss = db.get_bot_daily_loss(self.name, mode)
-        max_daily = config.get_max_daily_loss_per_bot()
-        if daily_loss >= max_daily:
+        # Resting GTC orders need asynchronous fill/cancel reconciliation before
+        # they can be represented safely as positions. Keep this experimental
+        # bot paper-only until that state machine exists.
+        if mode == "live":
+            log.warning(f"[{self.name}] Live maker execution is disabled")
+            return {"success": False, "reason": "live_maker_disabled"}
+
+        # Count pending stake and use this bot's explicit mode.
+        daily_risk = db.get_bot_daily_risk(self.name, mode)
+        max_daily = config.get_max_daily_loss_per_bot(mode)
+        bot_remaining = max_daily - daily_risk
+        if bot_remaining <= 0:
             self._paused = True
             log.warning(f"[{self.name}] Daily loss limit hit, pausing")
             return {"success": False, "reason": "daily_loss_limit"}
 
-        total_daily = db.get_total_daily_loss(mode)
-        if total_daily >= config.get_max_daily_loss_total():
+        total_daily = db.get_total_daily_risk(mode)
+        max_total = config.get_max_daily_loss_total(mode)
+        arena_remaining = max_total - total_daily
+        if arena_remaining <= 0:
             log.warning(f"[{self.name}] Arena daily loss limit hit")
             return {"success": False, "reason": "arena_loss_limit"}
 
         max_pos = config.LIVE_MAX_POSITION if mode == "live" else config.PAPER_MAX_POSITION
-        amount = min(signal.get("suggested_amount", max_pos * 0.5), max_pos)
+        amount = min(
+            signal.get("suggested_amount", max_pos * 0.5),
+            max_pos,
+            bot_remaining,
+            arena_remaining,
+        )
 
         try:
             if mode == "live":

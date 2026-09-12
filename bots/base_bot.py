@@ -4,6 +4,7 @@ import json
 import random
 import copy
 import logging
+import math
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -276,24 +277,46 @@ class BaseBot(ABC):
         self.trading_mode = db.get_bot_mode(self.name)
         mode = self.trading_mode
         venue = "polymarket" if mode == "live" else "simmer"
-        # Use per-bot mode for position limits (global config.TRADING_MODE is always "paper")
-        max_pos = config.LIVE_MAX_POSITION if mode == "live" else config.PAPER_MAX_POSITION
+        max_pos = config.get_max_position(mode)
 
-        # Check risk limits
-        daily_loss = db.get_bot_daily_loss(self.name, mode)
-        max_daily = config.get_max_daily_loss_per_bot()
-        if daily_loss >= max_daily:
+        # Count unresolved positions at full cost. Otherwise several orders can
+        # slip through before resolution and collectively exceed the loss cap.
+        bot_daily_risk = db.get_bot_daily_risk(self.name, mode)
+        max_daily = config.get_max_daily_loss_per_bot(mode)
+        bot_remaining = max_daily - bot_daily_risk
+        if bot_remaining <= 0:
             self._paused = True
-            logger.warning(f"[{self.name}] Daily loss limit hit (${daily_loss:.2f}), pausing")
+            logger.warning(
+                f"[{self.name}] Daily risk limit hit "
+                f"(${bot_daily_risk:.2f}/${max_daily:.2f}), pausing"
+            )
             return {"success": False, "reason": "daily_loss_limit"}
 
-        total_daily = db.get_total_daily_loss(mode)
-        max_total = config.get_max_daily_loss_total()
-        if total_daily >= max_total:
-            logger.warning(f"[{self.name}] Total arena daily loss limit hit (${total_daily:.2f})")
+        total_daily_risk = db.get_total_daily_risk(mode)
+        max_total = config.get_max_daily_loss_total(mode)
+        arena_remaining = max_total - total_daily_risk
+        if arena_remaining <= 0:
+            logger.warning(
+                f"[{self.name}] Total arena daily risk limit hit "
+                f"(${total_daily_risk:.2f}/${max_total:.2f})"
+            )
             return {"success": False, "reason": "arena_loss_limit"}
 
-        amount = min(signal.get("suggested_amount", max_pos * 0.5), max_pos)
+        suggested = signal.get("suggested_amount", max_pos * 0.5)
+        try:
+            suggested = float(suggested)
+        except (TypeError, ValueError):
+            return {"success": False, "reason": "invalid_amount"}
+        if not math.isfinite(suggested) or suggested <= 0:
+            return {"success": False, "reason": "invalid_amount"}
+
+        # Clamp this order to the remaining per-bot and arena loss budgets so
+        # the order itself cannot push either limit over the configured cap.
+        amount = math.floor(
+            min(suggested, max_pos, bot_remaining, arena_remaining) * 100
+        ) / 100
+        if amount <= 0:
+            return {"success": False, "reason": "risk_budget_exhausted"}
 
         try:
             if mode == "live":
@@ -325,10 +348,13 @@ class BaseBot(ABC):
 
     def mutate(self, winning_params: dict, mutation_rate: float = None) -> dict:
         """Create mutated params from winning bot's params."""
-        rate = mutation_rate or config.MUTATION_RATE
+        rate = config.MUTATION_RATE if mutation_rate is None else mutation_rate
         new_params = copy.deepcopy(winning_params)
 
-        numeric_keys = [k for k, v in new_params.items() if isinstance(v, (int, float))]
+        numeric_keys = [
+            k for k, v in new_params.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
         num_mutations = min(random.randint(2, 3), len(numeric_keys))
         keys_to_mutate = random.sample(numeric_keys, num_mutations) if numeric_keys else []
 
@@ -403,27 +429,57 @@ class BaseBot(ABC):
             logger.error(f"[{self.name}] No token ID for side={side} on {market.get('question', '')[:50]}")
             return {"success": False, "reason": "missing_token_id"}
 
+        try:
+            yes_price = float(market.get("current_price"))
+            expected_price = yes_price if side == "yes" else 1.0 - yes_price
+        except (TypeError, ValueError):
+            return {"success": False, "reason": "invalid_market_price"}
+        if not 0 < expected_price < 1:
+            return {"success": False, "reason": "invalid_market_price"}
+
+        # A Simmer quote is only a signal. Live execution must be bounded by
+        # the current CLOB ask so stale/divergent prices cannot create a bad fill.
+        price_cap = min(0.99, expected_price + config.LIVE_MAX_PRICE_DRIFT)
+        book = polymarket_client.get_market_info(token_id)
+        best_ask = book.get("best_ask") if book else None
+        if not book.get("asks") or best_ask is None:
+            logger.warning(f"[{self.name}] Empty CLOB ask book; live order rejected")
+            return {"success": False, "reason": "empty_order_book"}
+        if best_ask > price_cap:
+            logger.warning(
+                f"[{self.name}] CLOB ask {best_ask:.3f} exceeds "
+                f"price cap {price_cap:.3f}; live order rejected"
+            )
+            return {"success": False, "reason": "price_drift"}
+
         result = polymarket_client.place_market_order(
             token_id=token_id,
             side=side,
             amount=amount,
+            max_price=price_cap,
         )
 
         if result.get("success"):
+            amount_spent = result.get("amount_spent", amount)
             db.log_trade(
                 bot_name=self.name,
                 market_id=market.get("id") or market.get("market_id"),
                 market_question=market.get("question"),
                 side=signal["side"],
-                amount=amount,
+                amount=amount_spent,
                 venue="polymarket",
                 mode=mode,
                 confidence=signal["confidence"],
                 reasoning=signal.get("reasoning"),
                 trade_id=result.get("order_id"),
                 shares_bought=result.get("size"),
+                trade_features=signal.get("features"),
             )
-            logger.info(f"[{self.name}] LIVE trade: {signal['side']} ${amount} at {result.get('price')} on {market.get('question', '')[:50]}")
+            logger.info(
+                f"[{self.name}] LIVE trade: {signal['side']} "
+                f"${amount_spent:.2f} at {result.get('price')} "
+                f"on {market.get('question', '')[:50]}"
+            )
         else:
             logger.error(f"[{self.name}] LIVE trade failed: {result.get('error')}")
 

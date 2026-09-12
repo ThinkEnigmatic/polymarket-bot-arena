@@ -3,7 +3,7 @@
 import sqlite3
 import json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import config
 
@@ -155,7 +155,7 @@ def resolve_trade(internal_id, outcome, pnl):
 def get_bot_trades(bot_name, hours=None, limit=50):
     with get_conn() as conn:
         if hours:
-            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
             rows = conn.execute(
                 "SELECT * FROM trades WHERE bot_name=? AND created_at>=? ORDER BY created_at DESC LIMIT ?",
                 (bot_name, cutoff, limit)
@@ -174,7 +174,7 @@ def get_bot_performance(bot_name, hours=12, mode=None):
         conditions = ["bot_name=?", "outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')"]
         params = [bot_name]
         if hours is not None:
-            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
             conditions.append("created_at>=?")
             params.append(cutoff)
         if mode is not None:
@@ -200,7 +200,7 @@ def get_bot_performance(bot_name, hours=12, mode=None):
 
 def get_all_bots_performance(hours=12):
     with get_conn() as conn:
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         rows = conn.execute("""
             SELECT
                 bot_name,
@@ -300,7 +300,7 @@ def get_evolution_history(limit=20):
 
 def get_total_daily_loss(mode="paper"):
     with get_conn() as conn:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         row = conn.execute("""
             SELECT COALESCE(SUM(pnl), 0) as total_loss
             FROM trades
@@ -311,7 +311,7 @@ def get_total_daily_loss(mode="paper"):
 
 def get_bot_daily_loss(bot_name, mode="paper"):
     with get_conn() as conn:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         row = conn.execute("""
             SELECT COALESCE(SUM(pnl), 0) as total_loss
             FROM trades
@@ -320,10 +320,51 @@ def get_bot_daily_loss(bot_name, mode="paper"):
         return abs(dict(row)["total_loss"])
 
 
+def get_total_daily_risk(mode="paper"):
+    """Return today's realized losses plus unresolved capital at risk.
+
+    Pending prediction-market positions can still lose their full cost. Counting
+    them at the worst case prevents a burst of orders from exceeding the daily
+    loss limit before any of those markets resolve.
+    """
+    with get_conn() as conn:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = conn.execute("""
+            SELECT COALESCE(SUM(
+                CASE
+                    WHEN outcome IS NULL THEN amount
+                    WHEN pnl < 0 THEN -pnl
+                    ELSE 0
+                END
+            ), 0) AS total_risk
+            FROM trades
+            WHERE mode=? AND date(created_at)=?
+        """, (mode, today)).fetchone()
+        return float(row["total_risk"])
+
+
+def get_bot_daily_risk(bot_name, mode="paper"):
+    """Return one bot's realized losses plus unresolved capital at risk today."""
+    with get_conn() as conn:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        row = conn.execute("""
+            SELECT COALESCE(SUM(
+                CASE
+                    WHEN outcome IS NULL THEN amount
+                    WHEN pnl < 0 THEN -pnl
+                    ELSE 0
+                END
+            ), 0) AS total_risk
+            FROM trades
+            WHERE bot_name=? AND mode=? AND date(created_at)=?
+        """, (bot_name, mode, today)).fetchone()
+        return float(row["total_risk"])
+
+
 def get_dashboard_stats():
     with get_conn() as conn:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
 
         # Exclude phantom trades (pnl=0 resolved from voting era)
         today_stats = conn.execute("""
