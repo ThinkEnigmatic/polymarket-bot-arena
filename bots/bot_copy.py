@@ -367,7 +367,7 @@ class CopyBot:
         market_id = market.get("id") or market.get("market_id")
 
         # Simmer fill-price guard: reject if Simmer's current market price already
-        # exceeds max_price — this catches the case where tracked-wallet buys at 0.52
+        # exceeds max_price — this catches the case where a source buys at 0.52
         # on Polymarket but Simmer has diverged to 0.98 (different AMM state).
         # Without this check we'd lock in a terrible entry: risk $0.98 to win $0.02.
         simmer_price = market.get("current_price", 0.5)

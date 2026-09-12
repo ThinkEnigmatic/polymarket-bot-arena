@@ -2,8 +2,9 @@
 # Watchdog for the arena process.
 # Restarts the arena if its log file hasn't been updated in 5 minutes.
 
-LOG="/opt/polymarket-bot-arena/logs/arena.log"
-WATCHDOG_LOG="/opt/polymarket-bot-arena/logs/arena_watchdog.log"
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG="$PROJECT_DIR/logs/arena.log"
+WATCHDOG_LOG="$PROJECT_DIR/logs/arena_watchdog.log"
 STALE_SECONDS=300  # 5 minutes
 
 log() {

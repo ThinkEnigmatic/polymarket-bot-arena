@@ -28,7 +28,7 @@ def get_client() -> ClobClient:
     if _client is None:
         creds = _load_creds()
         pk = creds["private_key"]
-        funder = creds.get("wallet_address")  # proxy wallet (configured-proxy) holding USDC
+        funder = creds.get("wallet_address")  # configured proxy wallet holding USDC
         _client = ClobClient(
             host=config.POLYMARKET_HOST,
             key=pk,
