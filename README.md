@@ -87,6 +87,9 @@ python dashboard/server.py
 ```
 
 The dashboard user defaults to `admin`; override it with `ARENA_DASHBOARD_USER`.
+Keep credentials and machine-specific paths out of commits. The launchd plist
+files contain an `/opt/polymarket-bot-arena` deployment placeholder; set the
+correct path only in your private local installation.
 
 ## Dashboard
 

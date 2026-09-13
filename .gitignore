@@ -1,7 +1,15 @@
 # Credentials & secrets
 credentials.json
+secrets.json
+bot_keys.json
+.env
+.env.*
+!.env.example
+.envrc
 *.key
 *.pem
+*.p8
+*.p12
 
 # Database & state
 *.db
